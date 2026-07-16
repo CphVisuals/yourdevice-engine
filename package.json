@@ -1,0 +1,19 @@
+{
+  "name": "@repo/engine",
+  "version": "0.0.1",
+  "description": "Local-first, in-browser speech-to-text engine. Whisper on WebGPU/WASM (WebNN as progressive enhancement) — audio never leaves the device.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "tsc -p tsconfig.build.json"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.0",
+    "vitest": "^3.2.0"
+  }
+}
