@@ -148,6 +148,7 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
 
     let active: BackendId | null = null;
     let lastError: unknown = null;
+    let failedBackend: BackendId | null = null;
 
     // Try-init-with-fallback (CLAUDE.md rule 6): detection only gates what we
     // *try*; the first backend that successfully builds the pipeline wins.
@@ -165,11 +166,15 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
     // this *is* a runtime attempt, not feature-sniffing: `requestAdapter()`
     // can and does fail even when `navigator.gpu` exists), and only ever
     // call `pipeline()` once, for the first candidate whose handshake
-    // actually succeeds. If that one call still fails, we report
-    // `no-backend` rather than trying more devices in this worker — with the
-    // bug above, a second `pipeline()` call could not be trusted anyway; a
-    // retry needs a fresh Worker (fresh module state, so an unpoisoned
-    // `wasmInitPromise`).
+    // actually succeeds.
+    //
+    // If that one `pipeline()` call still fails (WebNN's documented failure
+    // mode: a context that builds but a graph that doesn't), this worker is
+    // spent — with the bug above, a second `pipeline()` call could not be
+    // trusted. So we report `model-load-failed` *with the failed backend
+    // named* and the host (`EngineClient.init`) resumes the ladder on a
+    // fresh Worker (fresh module state → unpoisoned `wasmInitPromise`),
+    // re-initing with that backend excluded from `backendPreference`.
     for (const backend of order) {
       if (abortedRequestIds.has(requestId)) break;
       const handshakeOk = await probeBackend(backend);
@@ -188,6 +193,7 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
         active = backend;
       } catch (err) {
         lastError = err;
+        failedBackend = backend;
       }
       break;
     }
@@ -198,6 +204,18 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
     }
 
     if (active === null) {
+      if (failedBackend !== null) {
+        // A backend passed its handshake but failed to build the pipeline.
+        // Name it so the host can retry on a fresh worker without it.
+        send({
+          type: 'error',
+          requestId,
+          code: 'model-load-failed',
+          backend: failedBackend,
+          message: describeError(lastError),
+        });
+        return;
+      }
       const detail =
         lastError === null ? 'no backend detected in this browser' : describeError(lastError);
       send({ type: 'error', requestId, code: 'no-backend', message: detail });

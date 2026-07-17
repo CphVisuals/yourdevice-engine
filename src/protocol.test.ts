@@ -128,6 +128,26 @@ describe('isWorkerMessage', () => {
     expect(isWorkerMessage({ type: 'error', requestId: 'r1', code: 'aborted', message: '' })).toBe(
       true,
     );
+    // The optional backend field (init-time fallback attribution) must accept
+    // every ladder backend and stay optional.
+    expect(
+      isWorkerMessage({
+        type: 'error',
+        requestId: 'i1',
+        code: 'model-load-failed',
+        message: 'graph build failed',
+        backend: 'webnn',
+      }),
+    ).toBe(true);
+    expect(
+      isWorkerMessage({
+        type: 'error',
+        requestId: 'i1',
+        code: 'model-load-failed',
+        message: 'x',
+        backend: 'wasm',
+      }),
+    ).toBe(true);
   });
 
   it('rejects messages whose payload does not match their type', () => {
@@ -155,6 +175,16 @@ describe('isWorkerMessage', () => {
       }),
     ).toBe(false);
     expect(isWorkerMessage({ type: 'error', code: 'out-of-cheese', message: 'x' })).toBe(false);
+    // backend, when present, must be a known ladder backend.
+    expect(
+      isWorkerMessage({ type: 'error', code: 'model-load-failed', message: 'x', backend: 'cuda' }),
+    ).toBe(false);
+    expect(
+      isWorkerMessage({ type: 'error', code: 'model-load-failed', message: 'x', backend: 42 }),
+    ).toBe(false);
+    expect(
+      isWorkerMessage({ type: 'error', code: 'model-load-failed', message: 'x', backend: null }),
+    ).toBe(false);
   });
 
   it('rejects host message types and junk', () => {

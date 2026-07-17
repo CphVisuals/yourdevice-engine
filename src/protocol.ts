@@ -50,7 +50,21 @@ export type WorkerMessage =
       totalSeconds: number;
     }
   | { type: 'complete'; requestId: string; segments: TranscriptSegment[] }
-  | { type: 'error'; requestId?: string; code: EngineErrorCode; message: string };
+  | {
+      type: 'error';
+      requestId?: string;
+      code: EngineErrorCode;
+      message: string;
+      /**
+       * The backend whose runtime init failed, when the failure is
+       * attributable to one (init-time `model-load-failed`). Lets the host
+       * retry on a fresh worker with that backend excluded — necessary
+       * because onnxruntime-web caches its first failed session-creation
+       * promise at module scope, so in-worker fallback after a failed
+       * `pipeline()` call is impossible (see worker.ts `handleInit`).
+       */
+      backend?: BackendId;
+    };
 
 const BACKEND_IDS = new Set<string>(BACKEND_LADDER);
 const ERROR_CODES = new Set<string>([
@@ -155,7 +169,9 @@ export function isWorkerMessage(value: unknown): value is WorkerMessage {
         (value.requestId === undefined || typeof value.requestId === 'string') &&
         typeof value.code === 'string' &&
         ERROR_CODES.has(value.code) &&
-        typeof value.message === 'string'
+        typeof value.message === 'string' &&
+        (value.backend === undefined ||
+          (typeof value.backend === 'string' && BACKEND_IDS.has(value.backend)))
       );
     default:
       return false;

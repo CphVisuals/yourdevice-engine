@@ -1,9 +1,17 @@
 /**
  * `EngineClient` — the framework-free host-side wrapper around the engine
- * worker. Dependency-injected with a `Worker` instance (constructed by the
- * host, e.g. `new Worker(new URL('@yourdevice/engine/worker', import.meta.url),
- * { type: 'module' })`) so this class stays testable with a fake
- * message-port and bundler-agnostic — it never constructs a `Worker` itself.
+ * worker. Dependency-injected with a *worker factory* (the host closes over
+ * its own `new Worker(new URL('@yourdevice/engine/worker', import.meta.url),
+ * { type: 'module' })` expression) so this class stays testable with a fake
+ * message-port and bundler-agnostic — it never names the worker URL itself.
+ *
+ * A factory rather than an instance because init-time backend fallback needs
+ * fresh workers: when a backend passes its runtime handshake but fails to
+ * build the model graph (WebNN's documented failure mode), onnxruntime-web's
+ * module-level session-promise cache leaves that worker unable to try any
+ * other backend (see worker.ts `handleInit`). `init` recovers here instead —
+ * it disposes the dead worker, spins up a fresh one from the factory, and
+ * re-inits with the failed backend excluded, until the ladder is exhausted.
  *
  * Never trusts a message off the worker port: every inbound message is
  * validated with `isWorkerMessage` before it can resolve/reject a pending
@@ -12,7 +20,7 @@
  * payloads").
  */
 
-import type { BackendId, CapabilityReport } from './backends.js';
+import { BACKEND_LADDER, type BackendId, type CapabilityReport } from './backends.js';
 import type { ModelId } from './models.js';
 import {
   isWorkerMessage,
@@ -33,15 +41,19 @@ export interface EngineWorkerLike {
   postMessage(message: HostMessage): void;
   addEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
   removeEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
+  terminate(): void;
 }
 
 export class EngineError extends Error {
   readonly code: EngineErrorCode;
+  /** The backend whose init failed, when the worker could attribute the failure. */
+  readonly backend?: BackendId;
 
-  constructor(code: EngineErrorCode, message: string) {
+  constructor(code: EngineErrorCode, message: string, backend?: BackendId) {
     super(message);
     this.name = 'EngineError';
     this.code = code;
+    this.backend = backend;
   }
 }
 
@@ -79,33 +91,65 @@ interface PendingTranscribe {
 type Pending = PendingInit | PendingTranscribe;
 
 export class EngineClient {
-  private readonly worker: EngineWorkerLike;
+  private readonly workerFactory: () => EngineWorkerLike;
+  private worker: EngineWorkerLike;
   private readonly pending = new Map<string, Pending>();
   private requestCounter = 0;
   private downloadProgressCallback: DownloadProgressCallback | null = null;
+  private disposed = false;
 
-  constructor(worker: EngineWorkerLike) {
-    this.worker = worker;
+  constructor(workerFactory: () => EngineWorkerLike) {
+    this.workerFactory = workerFactory;
+    this.worker = workerFactory();
     this.worker.addEventListener('message', this.handleMessage);
   }
 
-  /** Fires on every `download-progress` message, regardless of which `init` requested it. */
+  /**
+   * Fires on every `download-progress` message, regardless of which `init`
+   * requested it — including re-downloads on replacement workers during
+   * backend fallback (those are served from the browser Cache API, so they
+   * flash by fast, but they are still reported).
+   */
   set onDownloadProgress(callback: DownloadProgressCallback | null) {
     this.downloadProgressCallback = callback;
   }
 
-  init(modelId: ModelId, options: InitOptions = {}): Promise<CapabilityReport> {
-    const requestId = this.nextRequestId('init');
-    return new Promise<CapabilityReport>((resolve, reject) => {
-      this.pending.set(requestId, { kind: 'init', resolve, reject });
-      const message: HostMessage = {
-        type: 'init',
-        requestId,
-        modelId,
-        backendPreference: options.backendPreference ? [...options.backendPreference] : undefined,
-      };
-      this.worker.postMessage(message);
-    });
+  /**
+   * Initializes the engine, resuming the backend ladder across workers when
+   * needed: if a worker reports `model-load-failed` for a *named* backend
+   * (handshake passed, graph build failed — that worker is unrecoverable,
+   * see worker.ts), the dead worker is replaced with a fresh one from the
+   * factory and init retries with every already-failed backend excluded.
+   * Rejects with the last error once the ladder is exhausted.
+   */
+  async init(modelId: ModelId, options: InitOptions = {}): Promise<CapabilityReport> {
+    // The full sequence of backends this init may ever try: the caller's
+    // preference first (deduplicated), then the rest of the ladder — the
+    // same merge planBackendOrder performs in the worker.
+    const fullOrder = [...new Set([...(options.backendPreference ?? []), ...BACKEND_LADDER])];
+    const failed = new Set<BackendId>();
+    let preference = options.backendPreference ? [...options.backendPreference] : undefined;
+
+    for (;;) {
+      try {
+        return await this.initOnce(modelId, preference);
+      } catch (err) {
+        if (
+          !(err instanceof EngineError) ||
+          err.code !== 'model-load-failed' ||
+          err.backend === undefined ||
+          failed.has(err.backend) || // repeated failure of the same backend: give up
+          this.disposed
+        ) {
+          throw err;
+        }
+        failed.add(err.backend);
+        const remaining = fullOrder.filter((backend) => !failed.has(backend));
+        if (remaining.length === 0) throw err;
+        this.replaceWorker();
+        preference = remaining;
+      }
+    }
   }
 
   transcribe(
@@ -132,10 +176,46 @@ export class EngineClient {
     this.worker.postMessage(message);
   }
 
-  /** Detaches the message listener. The worker itself is owned by the caller. */
+  /** Detaches the message listener and terminates the current worker. */
   dispose(): void {
+    this.disposed = true;
     this.worker.removeEventListener('message', this.handleMessage);
+    this.worker.terminate();
     this.pending.clear();
+  }
+
+  /** One init attempt against the current worker. */
+  private initOnce(
+    modelId: ModelId,
+    backendPreference: readonly BackendId[] | undefined,
+  ): Promise<CapabilityReport> {
+    const requestId = this.nextRequestId('init');
+    return new Promise<CapabilityReport>((resolve, reject) => {
+      this.pending.set(requestId, { kind: 'init', resolve, reject });
+      const message: HostMessage = {
+        type: 'init',
+        requestId,
+        modelId,
+        backendPreference: backendPreference ? [...backendPreference] : undefined,
+      };
+      this.worker.postMessage(message);
+    });
+  }
+
+  /** Swaps the dead worker for a fresh one (used by init-time backend fallback). */
+  private replaceWorker(): void {
+    this.worker.removeEventListener('message', this.handleMessage);
+    this.worker.terminate();
+    // Anything else still pending was waiting on the dead worker; fail it
+    // now rather than let it hang forever. (The failed init that triggered
+    // the replacement has already been taken off the map.)
+    const orphaned = new EngineError('aborted', 'worker was replaced during backend fallback');
+    for (const [id, waiting] of this.pending) {
+      this.pending.delete(id);
+      waiting.reject(orphaned);
+    }
+    this.worker = this.workerFactory();
+    this.worker.addEventListener('message', this.handleMessage);
   }
 
   private nextRequestId(prefix: string): string {
@@ -176,7 +256,7 @@ export class EngineClient {
         break;
       }
       case 'error': {
-        const err = new EngineError(data.code, data.message);
+        const err = new EngineError(data.code, data.message, data.backend);
         if (data.requestId !== undefined) {
           const pending = this.pending.get(data.requestId);
           if (pending) {
