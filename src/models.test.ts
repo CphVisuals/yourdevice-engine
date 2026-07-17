@@ -14,6 +14,15 @@ describe('MODELS', () => {
     }
   });
 
+  it('gives every model an accelerated dtype with a float encoder and q4 decoder', () => {
+    // int8 on the WebGPU EP produces garbage output — accelerated backends
+    // must never receive q8 (see AcceleratedDtype in models.ts).
+    for (const spec of Object.values(MODELS)) {
+      expect(['fp32', 'fp16']).toContain(spec.acceleratedDtype.encoder_model);
+      expect(spec.acceleratedDtype.decoder_model_merged).toBe('q4');
+    }
+  });
+
   it('hides whisper-tiny (testing only) and lists every other model', () => {
     expect(MODELS['whisper-tiny'].hidden).toBe(true);
     expect(MODELS['whisper-base'].hidden).toBe(false);

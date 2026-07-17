@@ -1,5 +1,18 @@
 export type ModelId = 'whisper-base' | 'distil-small.en' | 'whisper-small' | 'whisper-tiny';
 
+/**
+ * Per-file dtype map for accelerated (WebGPU/WebNN) inference. int8 kernels
+ * are unreliable and slow on the WebGPU execution provider — q8 there
+ * produces garbage tokens (verified on real hardware 2026-07-17). The
+ * canonical accelerated Whisper config is a float encoder + q4 decoder; the
+ * encoder precision is per-model because fp32 encoders of the small-class
+ * models exceed practical download/upload sizes, so they use fp16.
+ */
+export interface AcceleratedDtype {
+  encoder_model: 'fp32' | 'fp16';
+  decoder_model_merged: 'q4';
+}
+
 export interface ModelSpec {
   id: ModelId;
   /** Hugging Face repo the ONNX weights are pulled from (R2 mirror takes over at launch). */
@@ -10,6 +23,8 @@ export interface ModelSpec {
   label: string;
   /** Hidden from the model picker UI (e.g. a tiny model kept around for E2E/manual testing only). */
   hidden: boolean;
+  /** Dtypes used on WebGPU/WebNN backends (WASM always uses q8). */
+  acceleratedDtype: AcceleratedDtype;
 }
 
 export const MODELS: Record<ModelId, ModelSpec> = {
@@ -20,6 +35,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     multilingual: true,
     label: 'Standard (all languages)',
     hidden: false,
+    acceleratedDtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
   },
   'distil-small.en': {
     id: 'distil-small.en',
@@ -28,6 +44,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     multilingual: false,
     label: 'Fast (English only)',
     hidden: false,
+    acceleratedDtype: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
   },
   'whisper-small': {
     id: 'whisper-small',
@@ -36,6 +53,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     multilingual: true,
     label: 'Quality (all languages)',
     hidden: false,
+    acceleratedDtype: { encoder_model: 'fp16', decoder_model_merged: 'q4' },
   },
   'whisper-tiny': {
     id: 'whisper-tiny',
@@ -44,6 +62,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     multilingual: true,
     label: 'Tiny (testing)',
     hidden: true,
+    acceleratedDtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
   },
 };
 

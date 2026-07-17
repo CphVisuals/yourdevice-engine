@@ -227,9 +227,23 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
         continue;
       }
       try {
+        // q8 is correct and compact on WASM, but int8 kernels on the WebGPU
+        // execution provider produce garbage tokens at a crawl (verified on
+        // real hardware) — accelerated backends get the per-model float
+        // encoder + q4 decoder config instead (see AcceleratedDtype).
+        // (Inline literal rather than the spec object: TS only assigns fresh
+        // object literals, not interface-typed aliases, to Record dtypes.)
+        const accelerated = MODELS[modelId].acceleratedDtype;
+        const dtype =
+          backend === 'wasm'
+            ? ('q8' as const)
+            : {
+                encoder_model: accelerated.encoder_model,
+                decoder_model_merged: accelerated.decoder_model_merged,
+              };
         const asr = await pipeline('automatic-speech-recognition', MODELS[modelId].hfRepo, {
           device: DEVICE_BY_BACKEND[backend],
-          dtype: 'q8',
+          dtype,
           progress_callback: (info) => handleDownloadProgress(requestId, modelId, info),
         });
         // Aborted while the pipeline was building: discard it *before*
