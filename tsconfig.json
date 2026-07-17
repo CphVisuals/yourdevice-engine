@@ -2,7 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "noEmit": true,
-    "types": []
+    "types": [],
+    // Worker-safe surface only: the engine runs in a Web Worker and must stay
+    // framework-free (CLAUDE.md rule 2). No DOM lib, so `document`/`window`
+    // references fail to type-check instead of slipping through.
+    "lib": ["ES2022", "WebWorker"]
   },
   "include": ["src/**/*"]
 }

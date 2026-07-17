@@ -1,10 +1,13 @@
-import type { BackendId, CapabilityReport } from './backends.js';
+import { BACKEND_LADDER, type BackendId, type CapabilityReport } from './backends.js';
 import { isModelId, type ModelId } from './models.js';
 
 /**
  * Message protocol between the host page and the engine worker. The worker
  * boundary is untyped at runtime, so both sides validate with the guards
  * below instead of trusting `postMessage` payloads.
+ *
+ * Every long-running operation — including `init`, which downloads model
+ * weights — carries a `requestId`, so `abort` can target any of them.
  */
 
 export interface TranscribeOptions {
@@ -25,14 +28,20 @@ export type EngineErrorCode =
 
 /** Host page -> worker. */
 export type HostMessage =
-  | { type: 'init'; modelId: ModelId; backendPreference?: BackendId[] }
+  | { type: 'init'; requestId: string; modelId: ModelId; backendPreference?: BackendId[] }
   | { type: 'transcribe'; requestId: string; audio: Float32Array; options: TranscribeOptions }
   | { type: 'abort'; requestId: string };
 
 /** Worker -> host page. */
 export type WorkerMessage =
-  | { type: 'ready'; capabilities: CapabilityReport; modelId: ModelId }
-  | { type: 'download-progress'; modelId: ModelId; loadedBytes: number; totalBytes: number }
+  | { type: 'ready'; requestId: string; capabilities: CapabilityReport; modelId: ModelId }
+  | {
+      type: 'download-progress';
+      requestId: string;
+      modelId: ModelId;
+      loadedBytes: number;
+      totalBytes: number;
+    }
   | {
       type: 'partial';
       requestId: string;
@@ -43,45 +52,112 @@ export type WorkerMessage =
   | { type: 'complete'; requestId: string; segments: TranscriptSegment[] }
   | { type: 'error'; requestId?: string; code: EngineErrorCode; message: string };
 
-const HOST_MESSAGE_TYPES = new Set(['init', 'transcribe', 'abort']);
-const WORKER_MESSAGE_TYPES = new Set([
-  'ready',
-  'download-progress',
-  'partial',
-  'complete',
-  'error',
+const BACKEND_IDS = new Set<string>(BACKEND_LADDER);
+const ERROR_CODES = new Set<string>([
+  'no-backend',
+  'model-load-failed',
+  'decode-failed',
+  'transcribe-failed',
+  'aborted',
 ]);
 
-function hasType(value: unknown): value is { type: string } {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === 'number' && Number.isFinite(value);
+}
+
+function isBackendIdArray(value: unknown): value is BackendId[] {
+  return Array.isArray(value) && value.every((id) => typeof id === 'string' && BACKEND_IDS.has(id));
+}
+
+function isTranscribeOptions(value: unknown): value is TranscribeOptions {
+  if (!isRecord(value)) return false;
+  if (value.task !== 'transcribe' && value.task !== 'translate') return false;
+  return value.language === undefined || typeof value.language === 'string';
+}
+
+function isTranscriptSegment(value: unknown): value is TranscriptSegment {
   return (
-    typeof value === 'object' &&
-    value !== null &&
-    typeof (value as { type?: unknown }).type === 'string'
+    isRecord(value) &&
+    isFiniteNumber(value.start) &&
+    isFiniteNumber(value.end) &&
+    typeof value.text === 'string'
   );
 }
 
+function isSegmentArray(value: unknown): value is TranscriptSegment[] {
+  return Array.isArray(value) && value.every(isTranscriptSegment);
+}
+
+function isCapabilityReport(value: unknown): value is CapabilityReport {
+  if (!isRecord(value) || !isRecord(value.detected)) return false;
+  for (const id of BACKEND_LADDER) {
+    if (typeof value.detected[id] !== 'boolean') return false;
+  }
+  const activeOk =
+    value.active === null || (typeof value.active === 'string' && BACKEND_IDS.has(value.active));
+  const memoryOk = value.deviceMemoryGb === null || isFiniteNumber(value.deviceMemoryGb);
+  return activeOk && memoryOk;
+}
+
 export function isHostMessage(value: unknown): value is HostMessage {
-  if (!hasType(value) || !HOST_MESSAGE_TYPES.has(value.type)) return false;
-  const msg = value as Partial<HostMessage> & { type: string };
-  switch (msg.type) {
+  if (!isRecord(value)) return false;
+  switch (value.type) {
     case 'init':
-      return isModelId((msg as { modelId?: unknown }).modelId);
-    case 'transcribe': {
-      const t = msg as { requestId?: unknown; audio?: unknown; options?: unknown };
       return (
-        typeof t.requestId === 'string' &&
-        t.audio instanceof Float32Array &&
-        typeof t.options === 'object' &&
-        t.options !== null
+        typeof value.requestId === 'string' &&
+        isModelId(value.modelId) &&
+        (value.backendPreference === undefined || isBackendIdArray(value.backendPreference))
       );
-    }
+    case 'transcribe':
+      return (
+        typeof value.requestId === 'string' &&
+        value.audio instanceof Float32Array &&
+        isTranscribeOptions(value.options)
+      );
     case 'abort':
-      return typeof (msg as { requestId?: unknown }).requestId === 'string';
+      return typeof value.requestId === 'string';
     default:
       return false;
   }
 }
 
 export function isWorkerMessage(value: unknown): value is WorkerMessage {
-  return hasType(value) && WORKER_MESSAGE_TYPES.has(value.type);
+  if (!isRecord(value)) return false;
+  switch (value.type) {
+    case 'ready':
+      return (
+        typeof value.requestId === 'string' &&
+        isCapabilityReport(value.capabilities) &&
+        isModelId(value.modelId)
+      );
+    case 'download-progress':
+      return (
+        typeof value.requestId === 'string' &&
+        isModelId(value.modelId) &&
+        isFiniteNumber(value.loadedBytes) &&
+        isFiniteNumber(value.totalBytes)
+      );
+    case 'partial':
+      return (
+        typeof value.requestId === 'string' &&
+        isSegmentArray(value.segments) &&
+        isFiniteNumber(value.processedSeconds) &&
+        isFiniteNumber(value.totalSeconds)
+      );
+    case 'complete':
+      return typeof value.requestId === 'string' && isSegmentArray(value.segments);
+    case 'error':
+      return (
+        (value.requestId === undefined || typeof value.requestId === 'string') &&
+        typeof value.code === 'string' &&
+        ERROR_CODES.has(value.code) &&
+        typeof value.message === 'string'
+      );
+    default:
+      return false;
+  }
 }

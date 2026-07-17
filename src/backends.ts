@@ -53,7 +53,9 @@ export function planBackendOrder(
   detected: Record<BackendId, boolean>,
   preference?: readonly BackendId[],
 ): BackendId[] {
-  const preferred = (preference ?? []).filter((id) => detected[id]);
+  // Deduplicate: a repeated preference entry must not cause a second init
+  // attempt of the same failed backend before falling through the ladder.
+  const preferred = [...new Set(preference ?? [])].filter((id) => detected[id]);
   const rest = BACKEND_LADDER.filter((id) => detected[id] && !preferred.includes(id));
   return [...preferred, ...rest];
 }

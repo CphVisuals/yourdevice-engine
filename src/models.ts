@@ -35,5 +35,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
 };
 
 export function isModelId(value: unknown): value is ModelId {
-  return typeof value === 'string' && value in MODELS;
+  // Object.hasOwn, not `in`: `in` walks the prototype chain, so inherited
+  // keys like 'toString' would validate as model ids.
+  return typeof value === 'string' && Object.hasOwn(MODELS, value);
 }
