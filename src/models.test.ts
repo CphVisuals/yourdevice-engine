@@ -13,6 +13,19 @@ describe('MODELS', () => {
       expect(spec.approxSizeMb).toBeGreaterThan(0);
     }
   });
+
+  it('hides whisper-tiny (testing only) and lists every other model', () => {
+    expect(MODELS['whisper-tiny'].hidden).toBe(true);
+    expect(MODELS['whisper-base'].hidden).toBe(false);
+    expect(MODELS['distil-small.en'].hidden).toBe(false);
+    expect(MODELS['whisper-small'].hidden).toBe(false);
+  });
+
+  it('declares hidden as a boolean for every model (UI filters on it)', () => {
+    for (const spec of Object.values(MODELS)) {
+      expect(typeof spec.hidden).toBe('boolean');
+    }
+  });
 });
 
 describe('isModelId', () => {

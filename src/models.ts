@@ -1,4 +1,4 @@
-export type ModelId = 'whisper-base' | 'distil-small.en' | 'whisper-small';
+export type ModelId = 'whisper-base' | 'distil-small.en' | 'whisper-small' | 'whisper-tiny';
 
 export interface ModelSpec {
   id: ModelId;
@@ -8,6 +8,8 @@ export interface ModelSpec {
   approxSizeMb: number;
   multilingual: boolean;
   label: string;
+  /** Hidden from the model picker UI (e.g. a tiny model kept around for E2E/manual testing only). */
+  hidden: boolean;
 }
 
 export const MODELS: Record<ModelId, ModelSpec> = {
@@ -17,6 +19,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     approxSizeMb: 80,
     multilingual: true,
     label: 'Standard (all languages)',
+    hidden: false,
   },
   'distil-small.en': {
     id: 'distil-small.en',
@@ -24,6 +27,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     approxSizeMb: 120,
     multilingual: false,
     label: 'Fast (English only)',
+    hidden: false,
   },
   'whisper-small': {
     id: 'whisper-small',
@@ -31,6 +35,15 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     approxSizeMb: 250,
     multilingual: true,
     label: 'Quality (all languages)',
+    hidden: false,
+  },
+  'whisper-tiny': {
+    id: 'whisper-tiny',
+    hfRepo: 'onnx-community/whisper-tiny',
+    approxSizeMb: 40,
+    multilingual: true,
+    label: 'Tiny (testing)',
+    hidden: true,
   },
 };
 
