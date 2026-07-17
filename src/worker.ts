@@ -52,6 +52,34 @@ const DEVICE_BY_BACKEND: Record<BackendId, 'webnn' | 'webgpu' | 'wasm'> = {
 let activePipeline: AutomaticSpeechRecognitionPipeline | null = null;
 let activeModelId: ModelId | null = null;
 
+/**
+ * Prefer a same-origin `/models/` mirror when the host serves one (see the
+ * site worker): Hugging Face's edge 503s browser requests from free-hosted
+ * origins, and third-party model CDNs appear on ad-blocker filter lists —
+ * same-origin traffic dodges both. One probe per worker; a miss (local dev,
+ * preview, no mirror deployed) leaves the default Hugging Face host in place.
+ */
+let modelHostConfigured = false;
+
+async function configureModelHost(modelId: ModelId): Promise<void> {
+  if (modelHostConfigured) return;
+  modelHostConfigured = true;
+  try {
+    const probeUrl = new URL(
+      `/models/${MODELS[modelId].hfRepo}/resolve/main/config.json`,
+      self.location.href,
+    );
+    const probe = await fetch(probeUrl, { method: 'HEAD' });
+    if (probe.ok) {
+      env.remoteHost = new URL('/models/', self.location.href).href;
+      // Same layout as the Hugging Face default, so R2 keys mirror HF paths.
+      env.remotePathTemplate = '{model}/resolve/{revision}/';
+    }
+  } catch {
+    // Mirror unreachable — keep the Hugging Face default.
+  }
+}
+
 /** requestId of the operation currently in flight, so `abort` can target it. */
 let inFlightInitRequestId: string | null = null;
 let inFlightTranscribeRequestId: string | null = null;
@@ -156,6 +184,8 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
   inFlightInitRequestId = requestId;
 
   try {
+    await configureModelHost(modelId);
+
     const scope = buildDetectionScope();
     const report = buildCapabilityReport(scope);
     const order = planBackendOrder(report.detected, backendPreference);
