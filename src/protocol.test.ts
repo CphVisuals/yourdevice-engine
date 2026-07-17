@@ -125,6 +125,7 @@ describe('isWorkerMessage', () => {
     ).toBe(true);
     expect(isWorkerMessage({ type: 'complete', requestId: 'r1', segments: [] })).toBe(true);
     expect(isWorkerMessage({ type: 'error', code: 'no-backend', message: 'x' })).toBe(true);
+    expect(isWorkerMessage({ type: 'error', code: 'worker-failed', message: 'x' })).toBe(true);
     expect(isWorkerMessage({ type: 'error', requestId: 'r1', code: 'aborted', message: '' })).toBe(
       true,
     );

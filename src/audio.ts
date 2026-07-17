@@ -5,7 +5,7 @@
  * `Float32Array`s plus the source sample rate.
  */
 
-const TARGET_SAMPLE_RATE = 16_000;
+export const TARGET_SAMPLE_RATE = 16_000;
 
 export interface DecodedAudioLike {
   /** One `Float32Array` per channel, each the same length. */

@@ -23,8 +23,19 @@ export interface TranscriptSegment {
   text: string;
 }
 
+/**
+ * `worker-failed` is raised by the host client when the Worker itself dies at
+ * the DOM level (script 404/CSP block/crash — an `error` event, not a
+ * protocol message); the worker never sends it, but it shares this vocabulary
+ * so hosts handle one error type.
+ */
 export type EngineErrorCode =
-  'no-backend' | 'model-load-failed' | 'decode-failed' | 'transcribe-failed' | 'aborted';
+  | 'no-backend'
+  | 'model-load-failed'
+  | 'decode-failed'
+  | 'transcribe-failed'
+  | 'aborted'
+  | 'worker-failed';
 
 /** Host page -> worker. */
 export type HostMessage =
@@ -73,6 +84,7 @@ const ERROR_CODES = new Set<string>([
   'decode-failed',
   'transcribe-failed',
   'aborted',
+  'worker-failed',
 ]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {

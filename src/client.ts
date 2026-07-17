@@ -40,7 +40,9 @@ import {
 export interface EngineWorkerLike {
   postMessage(message: HostMessage): void;
   addEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
+  addEventListener(type: 'error' | 'messageerror', listener: (event: Event) => void): void;
   removeEventListener(type: 'message', listener: (event: MessageEvent<unknown>) => void): void;
+  removeEventListener(type: 'error' | 'messageerror', listener: (event: Event) => void): void;
   terminate(): void;
 }
 
@@ -101,7 +103,20 @@ export class EngineClient {
   constructor(workerFactory: () => EngineWorkerLike) {
     this.workerFactory = workerFactory;
     this.worker = workerFactory();
-    this.worker.addEventListener('message', this.handleMessage);
+    this.attach(this.worker);
+  }
+
+  /** Wires up all listeners on a (fresh or initial) worker. */
+  private attach(worker: EngineWorkerLike): void {
+    worker.addEventListener('message', this.handleMessage);
+    worker.addEventListener('error', this.handleWorkerFailure);
+    worker.addEventListener('messageerror', this.handleWorkerFailure);
+  }
+
+  private detach(worker: EngineWorkerLike): void {
+    worker.removeEventListener('message', this.handleMessage);
+    worker.removeEventListener('error', this.handleWorkerFailure);
+    worker.removeEventListener('messageerror', this.handleWorkerFailure);
   }
 
   /**
@@ -170,18 +185,29 @@ export class EngineClient {
     });
   }
 
-  /** Best-effort: asks the worker to cancel `requestId` if it is still in flight. */
+  /**
+   * Best-effort: asks the worker to cancel `requestId` if it is still in
+   * flight. Only reaches the *current* worker — a request that belonged to a
+   * worker since replaced by backend fallback was already rejected when the
+   * worker was swapped, so there is nothing left to cancel.
+   */
   abort(requestId: string): void {
     const message: HostMessage = { type: 'abort', requestId };
     this.worker.postMessage(message);
   }
 
-  /** Detaches the message listener and terminates the current worker. */
+  /**
+   * Detaches listeners, terminates the current worker, and rejects every
+   * in-flight call with `aborted` — a promise that never settles would retain
+   * its suspended continuation (and any captured audio buffer) for the life
+   * of the page, and would hang the init retry loop before its own
+   * disposed-check could run.
+   */
   dispose(): void {
     this.disposed = true;
-    this.worker.removeEventListener('message', this.handleMessage);
+    this.detach(this.worker);
     this.worker.terminate();
-    this.pending.clear();
+    this.rejectAllPending(new EngineError('aborted', 'engine client disposed'));
   }
 
   /** One init attempt against the current worker. */
@@ -204,19 +230,37 @@ export class EngineClient {
 
   /** Swaps the dead worker for a fresh one (used by init-time backend fallback). */
   private replaceWorker(): void {
-    this.worker.removeEventListener('message', this.handleMessage);
+    this.detach(this.worker);
     this.worker.terminate();
     // Anything else still pending was waiting on the dead worker; fail it
     // now rather than let it hang forever. (The failed init that triggered
     // the replacement has already been taken off the map.)
-    const orphaned = new EngineError('aborted', 'worker was replaced during backend fallback');
+    this.rejectAllPending(
+      new EngineError('aborted', 'worker was replaced during backend fallback'),
+    );
+    this.worker = this.workerFactory();
+    this.attach(this.worker);
+  }
+
+  private rejectAllPending(err: EngineError): void {
     for (const [id, waiting] of this.pending) {
       this.pending.delete(id);
-      waiting.reject(orphaned);
+      waiting.reject(err);
     }
-    this.worker = this.workerFactory();
-    this.worker.addEventListener('message', this.handleMessage);
   }
+
+  /**
+   * The Worker died at the DOM level (script failed to load, CSP block,
+   * crash) — no protocol message will ever arrive, so without this every
+   * in-flight call would hang forever.
+   */
+  private readonly handleWorkerFailure = (event: Event): void => {
+    const detail =
+      'message' in event && typeof (event as ErrorEvent).message === 'string'
+        ? (event as ErrorEvent).message
+        : 'engine worker failed to load or crashed';
+    this.rejectAllPending(new EngineError('worker-failed', detail));
+  };
 
   private nextRequestId(prefix: string): string {
     this.requestCounter += 1;

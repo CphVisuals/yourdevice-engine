@@ -15,6 +15,7 @@ import type {
   ProgressInfo,
 } from '@huggingface/transformers';
 import { env, pipeline } from '@huggingface/transformers';
+import { TARGET_SAMPLE_RATE } from './audio.js';
 import {
   buildCapabilityReport,
   planBackendOrder,
@@ -188,6 +189,11 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
           dtype: 'q8',
           progress_callback: (info) => handleDownloadProgress(requestId, modelId, info),
         });
+        // Aborted while the pipeline was building: discard it *before*
+        // installing, or this stale continuation would overwrite whatever a
+        // newer init has since loaded (wrong model for every later
+        // transcribe, with no error surfaced).
+        if (abortedRequestIds.has(requestId)) break;
         activePipeline = asr;
         activeModelId = modelId;
         active = backend;
@@ -237,19 +243,22 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
 
 function toSegments(
   output: AutomaticSpeechRecognitionOutput | AutomaticSpeechRecognitionOutput[],
+  totalSeconds: number,
 ): TranscriptSegment[] {
   const result = Array.isArray(output) ? output[0] : output;
   if (!result) return [];
   if (!result.chunks || result.chunks.length === 0) {
-    return result.text.trim() ? [{ start: 0, end: 0, text: result.text.trim() }] : [];
+    return result.text.trim() ? [{ start: 0, end: totalSeconds, text: result.text.trim() }] : [];
   }
-  return result.chunks.map((chunk) => {
+  return result.chunks.map((chunk, index, chunks) => {
     const [start, rawEnd] = chunk.timestamp;
-    // Whisper's timestamp decoder can leave the final chunk's end timestamp
-    // `null` at runtime even though the type says `[number, number]` (a
-    // known Transformers.js quirk); fall back to the start rather than
-    // trust the type blindly.
-    const end = typeof rawEnd === 'number' ? rawEnd : start;
+    // Whisper's timestamp decoder legitimately leaves the final chunk's end
+    // timestamp `null` (the closing timestamp token is not always emitted)
+    // even though the type says `[number, number]`. Fall back to the audio's
+    // total duration for the last chunk — collapsing it to `start` would
+    // render real speech as a zero-width range.
+    const end =
+      typeof rawEnd === 'number' ? rawEnd : index === chunks.length - 1 ? totalSeconds : start;
     return { start, end, text: chunk.text.trim() };
   });
 }
@@ -265,6 +274,19 @@ async function handleTranscribe(
       requestId,
       code: 'transcribe-failed',
       message: 'engine is not initialized; call init before transcribe',
+    });
+    return;
+  }
+
+  // One transcription at a time: the pipeline/session is not reentrant, and
+  // allowing overlap would clobber the in-flight bookkeeping (an abort for
+  // the first request would silently no-op against the second's id).
+  if (inFlightTranscribeRequestId !== null) {
+    send({
+      type: 'error',
+      requestId,
+      code: 'transcribe-failed',
+      message: 'a transcription is already in flight; await or abort it first',
     });
     return;
   }
@@ -287,7 +309,8 @@ async function handleTranscribe(
     const output = await activePipeline(audio, asrOptions);
 
     if (abortedRequestIds.has(requestId)) return;
-    send({ type: 'complete', requestId, segments: toSegments(output) });
+    const totalSeconds = audio.length / TARGET_SAMPLE_RATE;
+    send({ type: 'complete', requestId, segments: toSegments(output, totalSeconds) });
   } catch (err) {
     if (!abortedRequestIds.has(requestId)) {
       send({ type: 'error', requestId, code: 'transcribe-failed', message: describeError(err) });

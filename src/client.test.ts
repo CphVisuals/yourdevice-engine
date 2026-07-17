@@ -16,6 +16,7 @@ class FakeWorker implements EngineWorkerLike {
   readonly posted: HostMessage[] = [];
   terminated = false;
   private listeners = new Set<(event: MessageEvent<unknown>) => void>();
+  private errorListeners = new Set<(event: Event) => void>();
 
   constructor(private readonly script?: (message: HostMessage, worker: FakeWorker) => void) {}
 
@@ -27,12 +28,20 @@ class FakeWorker implements EngineWorkerLike {
     }
   }
 
-  addEventListener(_type: 'message', listener: (event: MessageEvent<unknown>) => void): void {
-    this.listeners.add(listener);
+  addEventListener(type: string, listener: (event: never) => void): void {
+    if (type === 'message') {
+      this.listeners.add(listener as (event: MessageEvent<unknown>) => void);
+    } else {
+      this.errorListeners.add(listener as (event: Event) => void);
+    }
   }
 
-  removeEventListener(_type: 'message', listener: (event: MessageEvent<unknown>) => void): void {
-    this.listeners.delete(listener);
+  removeEventListener(type: string, listener: (event: never) => void): void {
+    if (type === 'message') {
+      this.listeners.delete(listener as (event: MessageEvent<unknown>) => void);
+    } else {
+      this.errorListeners.delete(listener as (event: Event) => void);
+    }
   }
 
   terminate(): void {
@@ -43,6 +52,12 @@ class FakeWorker implements EngineWorkerLike {
   emit(message: WorkerMessage): void {
     const event = { data: message } as MessageEvent<unknown>;
     for (const listener of this.listeners) listener(event);
+  }
+
+  /** Simulates a DOM-level worker failure (script 404, CSP block, crash). */
+  emitError(message?: string): void {
+    const event = (message !== undefined ? { message } : {}) as Event;
+    for (const listener of this.errorListeners) listener(event);
   }
 
   /** Simulates arbitrary noise on the port that does not satisfy the protocol. */
@@ -426,21 +441,52 @@ describe('EngineClient.abort', () => {
 });
 
 describe('EngineClient.dispose', () => {
-  it('terminates the worker and stops reacting to its messages', async () => {
+  it('terminates the worker and rejects in-flight calls instead of stranding them', async () => {
     const worker = new FakeWorker();
     const client = new EngineClient(() => worker);
     const initPromise = client.init('whisper-base');
-    const requestId = worker.posted[0]?.requestId ?? '';
 
     client.dispose();
     expect(worker.terminated).toBe(true);
-    worker.emit({ type: 'ready', requestId, capabilities, modelId: 'whisper-base' });
 
-    // Give any stray microtask a chance to run, then assert nothing settled it.
-    const race = await Promise.race([
-      initPromise.then(() => 'resolved' as const),
-      new Promise((resolve) => setTimeout(() => resolve('pending' as const), 10)),
-    ]);
-    expect(race).toBe('pending');
+    // A promise that never settles would retain its suspended continuation
+    // (and any captured audio) for the life of the page — dispose must
+    // reject, not merely forget.
+    await expect(initPromise).rejects.toMatchObject({
+      name: 'EngineError',
+      code: 'aborted',
+      message: 'engine client disposed',
+    });
+  });
+});
+
+describe('worker DOM-level failure', () => {
+  it("rejects in-flight calls with 'worker-failed' when the worker errors instead of hanging", async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+    const initPromise = client.init('whisper-base');
+
+    // Script 404 / CSP block: the browser fires an ErrorEvent and no protocol
+    // message will ever arrive.
+    worker.emitError('failed to fetch worker script');
+
+    await expect(initPromise).rejects.toMatchObject({
+      name: 'EngineError',
+      code: 'worker-failed',
+      message: 'failed to fetch worker script',
+    });
+  });
+
+  it('uses a fallback message when the error event carries none', async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+    const initPromise = client.init('whisper-base');
+
+    worker.emitError();
+
+    await expect(initPromise).rejects.toMatchObject({
+      code: 'worker-failed',
+      message: 'engine worker failed to load or crashed',
+    });
   });
 });
