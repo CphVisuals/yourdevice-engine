@@ -19,6 +19,7 @@ export {
   type WorkerMessage,
 } from './protocol.js';
 export { resampleTo16kMono, type DecodedAudioLike } from './audio.js';
+export { toJson, toSrt, toTxt, toVtt } from './export.js';
 export {
   EngineClient,
   EngineError,
