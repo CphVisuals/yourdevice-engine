@@ -5,13 +5,18 @@
   "license": "MIT",
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./worker": "./src/worker.ts"
   },
   "publishConfig": {
     "exports": {
       ".": {
         "types": "./dist/index.d.ts",
         "default": "./dist/index.js"
+      },
+      "./worker": {
+        "types": "./dist/worker.d.ts",
+        "default": "./dist/worker.js"
       }
     }
   },
@@ -24,6 +29,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "tsc -p tsconfig.build.json"
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^3.8.1"
   },
   "devDependencies": {
     "typescript": "^5.8.0",

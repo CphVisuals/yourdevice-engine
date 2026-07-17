@@ -18,3 +18,24 @@ export {
   type TranscriptSegment,
   type WorkerMessage,
 } from './protocol.js';
+export { resampleTo16kMono, type DecodedAudioLike } from './audio.js';
+export {
+  EngineClient,
+  EngineError,
+  type DownloadProgressCallback,
+  type EngineWorkerLike,
+  type InitOptions,
+  type TranscribeCallbacks,
+} from './client.js';
+
+/**
+ * The worker itself is not exported from here (it's an entry point, not a
+ * library module — it calls `addEventListener`/`postMessage` as a side
+ * effect on import). Hosts construct it directly from its dedicated module
+ * export condition:
+ *
+ *   new Worker(new URL('@yourdevice/engine/worker', import.meta.url), { type: 'module' })
+ *
+ * See package.json `exports['./worker']` (workspace: `src/worker.ts`;
+ * published: `dist/worker.js` via `publishConfig.exports`).
+ */
