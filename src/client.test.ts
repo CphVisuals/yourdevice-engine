@@ -438,6 +438,123 @@ describe('EngineClient.abort', () => {
     client.abort('transcribe-1');
     expect(worker.posted).toEqual([{ type: 'abort', requestId: 'transcribe-1' }]);
   });
+
+  it('rejects the matching in-flight call immediately (no worker round-trip)', async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+
+    const transcribePromise = client.transcribe(new Float32Array(16), { task: 'transcribe' });
+    const requestId = worker.posted[0]?.requestId ?? '';
+    client.abort(requestId);
+
+    // Settled locally: the worker may be stuck in a synchronous WASM call and
+    // never able to acknowledge before finishing — the host must not wait.
+    await expect(transcribePromise).rejects.toMatchObject({
+      name: 'EngineError',
+      code: 'aborted',
+    });
+  });
+
+  it("drops a late 'complete' that raced past the abort", async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+
+    const transcribePromise = client.transcribe(new Float32Array(16), { task: 'transcribe' });
+    const requestId = worker.posted[0]?.requestId ?? '';
+    client.abort(requestId);
+    await expect(transcribePromise).rejects.toMatchObject({ code: 'aborted' });
+
+    // The worker finished the window anyway and sent complete — must be a
+    // no-op, not an unhandled resolve or a crash.
+    expect(() =>
+      worker.emit({ type: 'complete', requestId, segments: [{ start: 0, end: 1, text: 'late' }] }),
+    ).not.toThrow();
+  });
+
+  it('does not disturb other in-flight calls', async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+
+    const first = client.transcribe(new Float32Array(1), { task: 'transcribe' });
+    const second = client.transcribe(new Float32Array(1), { task: 'transcribe' });
+    const firstId = worker.posted[0]?.requestId ?? '';
+    const secondId = worker.posted[1]?.requestId ?? '';
+
+    client.abort(firstId);
+    await expect(first).rejects.toMatchObject({ code: 'aborted' });
+
+    worker.emit({ type: 'complete', requestId: secondId, segments: [] });
+    await expect(second).resolves.toEqual([]);
+  });
+});
+
+describe('onRequestStart', () => {
+  it('reports the transcribe requestId before the message is posted, and it matches', async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+    const seen: string[] = [];
+    let postedCountAtCallback = -1;
+
+    const transcribePromise = client.transcribe(
+      new Float32Array(16),
+      { task: 'transcribe' },
+      {
+        onRequestStart: (requestId) => {
+          seen.push(requestId);
+          postedCountAtCallback = worker.posted.length;
+        },
+      },
+    );
+
+    expect(seen).toHaveLength(1);
+    expect(postedCountAtCallback).toBe(0); // fired before postMessage → abort can never miss
+    const posted = worker.posted[0];
+    expect(posted?.requestId).toBe(seen[0]);
+
+    // The reported id is the one abort must target: aborting it settles the call.
+    client.abort(seen[0] ?? '');
+    worker.emit({ type: 'error', requestId: seen[0] ?? '', code: 'aborted', message: 'aborted' });
+    await expect(transcribePromise).rejects.toMatchObject({ code: 'aborted' });
+  });
+
+  it('reports the init requestId of every attempt across backend fallback', async () => {
+    const workers: FakeWorker[] = [];
+    const factory = (): FakeWorker => {
+      const index = workers.length;
+      const worker = new FakeWorker((message, w) => {
+        if (message.type !== 'init') return;
+        if (index === 0) {
+          w.emit({
+            type: 'error',
+            requestId: message.requestId,
+            code: 'model-load-failed',
+            backend: 'webgpu',
+            message: 'graph build failed',
+          });
+        } else {
+          w.emit({
+            type: 'ready',
+            requestId: message.requestId,
+            capabilities: { ...capabilities, active: 'wasm' },
+            modelId: message.modelId,
+          });
+        }
+      });
+      workers.push(worker);
+      return worker;
+    };
+
+    const client = new EngineClient(factory);
+    const seen: string[] = [];
+    await client.init('whisper-base', { onRequestStart: (requestId) => seen.push(requestId) });
+
+    // One id per attempt (first worker failed, second succeeded), all distinct,
+    // each matching what was actually posted to its worker.
+    expect(seen).toHaveLength(2);
+    expect(new Set(seen).size).toBe(2);
+    expect(workers[0]?.posted[0]?.requestId).toBe(seen[0]);
+    expect(workers[1]?.posted[0]?.requestId).toBe(seen[1]);
+  });
 });
 
 describe('EngineClient.dispose', () => {

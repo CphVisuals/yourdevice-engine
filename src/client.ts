@@ -61,6 +61,12 @@ export class EngineError extends Error {
 
 export interface InitOptions {
   backendPreference?: readonly BackendId[];
+  /**
+   * Fires with the requestId of every init attempt this call makes (backend
+   * fallback retries each get a fresh id), so the host can `abort()` the one
+   * currently in flight — e.g. from a Cancel button during model download.
+   */
+  onRequestStart?: (requestId: string) => void;
 }
 
 export interface TranscribeCallbacks {
@@ -69,6 +75,8 @@ export interface TranscribeCallbacks {
     processedSeconds: number,
     totalSeconds: number,
   ) => void;
+  /** Fires with this call's requestId before it is posted, so the host can `abort()` it. */
+  onRequestStart?: (requestId: string) => void;
 }
 
 export type DownloadProgressCallback = (info: {
@@ -147,7 +155,7 @@ export class EngineClient {
 
     for (;;) {
       try {
-        return await this.initOnce(modelId, preference);
+        return await this.initOnce(modelId, preference, options.onRequestStart);
       } catch (err) {
         if (
           !(err instanceof EngineError) ||
@@ -173,6 +181,7 @@ export class EngineClient {
     callbacks: TranscribeCallbacks = {},
   ): Promise<TranscriptSegment[]> {
     const requestId = this.nextRequestId('transcribe');
+    callbacks.onRequestStart?.(requestId);
     return new Promise<TranscriptSegment[]>((resolve, reject) => {
       this.pending.set(requestId, {
         kind: 'transcribe',
@@ -186,14 +195,27 @@ export class EngineClient {
   }
 
   /**
-   * Best-effort: asks the worker to cancel `requestId` if it is still in
-   * flight. Only reaches the *current* worker — a request that belonged to a
-   * worker since replaced by backend fallback was already rejected when the
-   * worker was swapped, so there is nothing left to cancel.
+   * Cancels `requestId`: rejects the matching in-flight call immediately with
+   * code 'aborted' and notifies the worker best-effort.
+   *
+   * The local rejection is deliberate, not just an optimization: the worker
+   * may be deep inside a synchronous WASM inference call and unable to
+   * service the abort message until the current window finishes — and if
+   * that window was the last one, its 'complete' can race ahead of the abort
+   * entirely. The host must not depend on winning that race; it settles now
+   * and any late 'complete'/'error' for this id is dropped (its pending
+   * entry is gone). Only reaches the *current* worker — a request that
+   * belonged to a worker since replaced by backend fallback was already
+   * rejected when the worker was swapped.
    */
   abort(requestId: string): void {
     const message: HostMessage = { type: 'abort', requestId };
     this.worker.postMessage(message);
+    const pending = this.pending.get(requestId);
+    if (pending) {
+      this.pending.delete(requestId);
+      pending.reject(new EngineError('aborted', 'aborted by host request'));
+    }
   }
 
   /**
@@ -214,8 +236,10 @@ export class EngineClient {
   private initOnce(
     modelId: ModelId,
     backendPreference: readonly BackendId[] | undefined,
+    onRequestStart?: (requestId: string) => void,
   ): Promise<CapabilityReport> {
     const requestId = this.nextRequestId('init');
+    onRequestStart?.(requestId);
     return new Promise<CapabilityReport>((resolve, reject) => {
       this.pending.set(requestId, { kind: 'init', resolve, reject });
       const message: HostMessage = {
