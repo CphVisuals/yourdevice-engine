@@ -56,8 +56,20 @@ let activeModelId: ModelId | null = null;
 let inFlightInitRequestId: string | null = null;
 let inFlightTranscribeRequestId: string | null = null;
 
-/** requestIds that were aborted while their operation was still running. */
+/** requestIds that were aborted while their operation was still running or queued. */
 const abortedRequestIds = new Set<string>();
+
+/**
+ * Transcribe requests are serialized, not rejected on overlap: the pipeline
+ * isn't reentrant, and after a host-side cancel the current window keeps
+ * draining (there is no cancellation hook inside a pipeline call) while the
+ * host is already free to submit the next file. Each new request chains
+ * behind the previous one's completion; a failure in one job must never
+ * poison the chain for its successors.
+ */
+let transcribeChain: Promise<void> = Promise.resolve();
+/** requestIds accepted but not yet started, so `abort` can cancel them too. */
+const queuedTranscribeIds = new Set<string>();
 
 /** Per-request, per-file download progress, aggregated into one byte count. */
 const downloadProgressByRequest = new Map<string, Map<string, { loaded: number; total: number }>>();
@@ -279,19 +291,6 @@ async function handleTranscribe(
     return;
   }
 
-  // One transcription at a time: the pipeline/session is not reentrant, and
-  // allowing overlap would clobber the in-flight bookkeeping (an abort for
-  // the first request would silently no-op against the second's id).
-  if (inFlightTranscribeRequestId !== null) {
-    send({
-      type: 'error',
-      requestId,
-      code: 'transcribe-failed',
-      message: 'a transcription is already in flight; await or abort it first',
-    });
-    return;
-  }
-
   inFlightTranscribeRequestId = requestId;
   try {
     const spec = MODELS[activeModelId];
@@ -366,12 +365,15 @@ function handleAbort(message: Extract<HostMessage, { type: 'abort' }>): void {
   const { requestId } = message;
   const matchesInit = requestId === inFlightInitRequestId;
   const matchesTranscribe = requestId === inFlightTranscribeRequestId;
-  if (!matchesInit && !matchesTranscribe) {
-    // Nothing in flight under this requestId (already finished, or never
-    // started) — nothing to cancel.
+  const matchesQueued = queuedTranscribeIds.has(requestId);
+  if (!matchesInit && !matchesTranscribe && !matchesQueued) {
+    // Nothing running or queued under this requestId (already finished, or
+    // never started) — nothing to cancel.
     return;
   }
 
+  // A queued job is marked aborted here and skipped when its turn comes (the
+  // serialization chain checks abortedRequestIds before starting it).
   abortedRequestIds.add(requestId);
   if (matchesInit) inFlightInitRequestId = null;
   if (matchesTranscribe) inFlightTranscribeRequestId = null;
@@ -393,7 +395,22 @@ addEventListener('message', (event: MessageEvent<unknown>) => {
       void handleInit(data);
       break;
     case 'transcribe':
-      void handleTranscribe(data);
+      // Serialize: run after the previous transcribe fully drains (see the
+      // comment on `transcribeChain`).
+      queuedTranscribeIds.add(data.requestId);
+      transcribeChain = transcribeChain
+        .then(() => {
+          queuedTranscribeIds.delete(data.requestId);
+          if (abortedRequestIds.has(data.requestId)) {
+            // Aborted while queued: skip it — handleAbort already replied.
+            abortedRequestIds.delete(data.requestId);
+            return;
+          }
+          return handleTranscribe(data);
+        })
+        // handleTranscribe reports its own failures over the port; this catch
+        // only guards the chain itself so one job can never block successors.
+        .catch(() => {});
       break;
     case 'abort':
       handleAbort(data);
