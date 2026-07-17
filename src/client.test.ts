@@ -486,6 +486,87 @@ describe('EngineClient.abort', () => {
     worker.emit({ type: 'complete', requestId: secondId, segments: [] });
     await expect(second).resolves.toEqual([]);
   });
+
+  it('replaces the worker when an init is aborted (termination is the only real download cancel)', async () => {
+    const workers: FakeWorker[] = [];
+    const factory = (): FakeWorker => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    };
+    const client = new EngineClient(factory);
+
+    const initPromise = client.init('whisper-base');
+    const requestId = workers[0]?.posted[0]?.requestId ?? '';
+    client.abort(requestId);
+
+    await expect(initPromise).rejects.toMatchObject({ code: 'aborted' });
+    // Old worker (still downloading in the background) is gone; a fresh one
+    // with clean module state (unpoisoned wasmInitPromise) took its place.
+    expect(workers).toHaveLength(2);
+    expect(workers[0]?.terminated).toBe(true);
+    expect(workers[1]?.terminated).toBe(false);
+  });
+
+  it('lets a subsequent init succeed on the replacement worker', async () => {
+    const workers: FakeWorker[] = [];
+    const factory = (): FakeWorker => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    };
+    const client = new EngineClient(factory);
+
+    const aborted = client.init('whisper-base');
+    client.abort(workers[0]?.posted[0]?.requestId ?? '');
+    await expect(aborted).rejects.toMatchObject({ code: 'aborted' });
+
+    const retry = client.init('whisper-base');
+    const replacement = workers[1];
+    const retryId = replacement?.posted[0]?.requestId ?? '';
+    expect(replacement?.posted[0]?.type).toBe('init');
+    replacement?.emit({ type: 'ready', requestId: retryId, capabilities, modelId: 'whisper-base' });
+
+    await expect(retry).resolves.toEqual(capabilities);
+    expect(workers).toHaveLength(2); // no third worker needed
+  });
+
+  it('does not replace the worker when a transcribe is aborted', async () => {
+    const workers: FakeWorker[] = [];
+    const factory = (): FakeWorker => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    };
+    const client = new EngineClient(factory);
+
+    const transcribePromise = client.transcribe(new Float32Array(1), { task: 'transcribe' });
+    client.abort(workers[0]?.posted[0]?.requestId ?? '');
+
+    await expect(transcribePromise).rejects.toMatchObject({ code: 'aborted' });
+    expect(workers).toHaveLength(1);
+    expect(workers[0]?.terminated).toBe(false);
+  });
+
+  it('does not spawn a replacement worker on a disposed client', async () => {
+    const workers: FakeWorker[] = [];
+    const factory = (): FakeWorker => {
+      const worker = new FakeWorker();
+      workers.push(worker);
+      return worker;
+    };
+    const client = new EngineClient(factory);
+
+    const initPromise = client.init('whisper-base');
+    const requestId = workers[0]?.posted[0]?.requestId ?? '';
+    client.dispose();
+    await expect(initPromise).rejects.toMatchObject({ code: 'aborted' });
+
+    // Late abort after dispose (e.g. an unmount race) must not resurrect a worker.
+    client.abort(requestId);
+    expect(workers).toHaveLength(1);
+    expect(workers[0]?.terminated).toBe(true);
+  });
 });
 
 describe('onRequestStart', () => {

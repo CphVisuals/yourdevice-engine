@@ -215,6 +215,15 @@ export class EngineClient {
     if (pending) {
       this.pending.delete(requestId);
       pending.reject(new EngineError('aborted', 'aborted by host request'));
+      // Aborting an init needs more than a local reject: the worker would
+      // keep downloading model weights in the background (terminating it is
+      // the only real cancellation), and a later init would call pipeline()
+      // concurrently with the aborted-but-still-running one in the same
+      // worker — re-exposing the poisoned wasmInitPromise bug the ladder
+      // design exists to avoid. A fresh worker gives clean module state.
+      if (pending.kind === 'init' && !this.disposed) {
+        this.replaceWorker();
+      }
     }
   }
 
