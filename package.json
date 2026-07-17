@@ -1,5 +1,5 @@
 {
-  "name": "@repo/engine",
+  "name": "@yourdevice/engine",
   "version": "0.0.1",
   "description": "Local-first, in-browser speech-to-text engine. Whisper on WebGPU/WASM (WebNN as progressive enhancement) — audio never leaves the device.",
   "license": "MIT",

@@ -1,12 +1,12 @@
-# engine
+# @yourdevice/engine
 
-Local-first, in-browser speech-to-text engine. Whisper running entirely in the
+Local-first, in-browser speech-to-text engine for YourDevice. Whisper running entirely in the
 browser — on WebGPU where available, WebNN as a progressive enhancement, and a
 single-threaded WASM (SIMD) floor. Audio never leaves the device.
 
 > Status: pre-release skeleton. The typed worker protocol and backend ladder are
 > in place; inference lands next. This package is framework-free and will be
-> published under its final name at launch.
+> published as `@yourdevice/engine` at launch.
 
 ## Design
 
