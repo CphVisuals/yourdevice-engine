@@ -31,6 +31,7 @@ import {
   type TranscriptSegment,
   type WorkerMessage,
 } from './protocol.js';
+import { dedupeWindowSegments, planWindows, WINDOW_SECONDS } from './windows.js';
 
 // No COOP/COEP at launch (CLAUDE.md rule 7: no ad-iframe-breaking cross-origin
 // isolation headers), so there is no SharedArrayBuffer — the WASM floor must
@@ -300,17 +301,57 @@ async function handleTranscribe(
     const asrOptions = spec.multilingual
       ? {
           return_timestamps: true as const,
-          chunk_length_s: 30,
+          chunk_length_s: WINDOW_SECONDS,
           task: options.task,
           ...(options.language ? { language: options.language } : {}),
         }
-      : { return_timestamps: true as const, chunk_length_s: 30 };
+      : { return_timestamps: true as const, chunk_length_s: WINDOW_SECONDS };
 
-    const output = await activePipeline(audio, asrOptions);
-
-    if (abortedRequestIds.has(requestId)) return;
     const totalSeconds = audio.length / TARGET_SAMPLE_RATE;
-    send({ type: 'complete', requestId, segments: toSegments(output, totalSeconds) });
+    const windows = planWindows(audio.length, TARGET_SAMPLE_RATE);
+
+    // Audio that fits in one window skips the loop machinery entirely.
+    if (windows.length <= 1) {
+      const output = await activePipeline(audio, asrOptions);
+      if (abortedRequestIds.has(requestId)) return;
+      send({ type: 'complete', requestId, segments: toSegments(output, totalSeconds) });
+      return;
+    }
+
+    // Long audio: process window by window (30 s each, advancing 25 s so
+    // consecutive windows share a 5 s overlap), streaming 'partial' after
+    // each. `subarray` views into the one buffer — no per-window copies, so
+    // memory stays bounded by the input plus one window of model state. The
+    // abort check at the top of each iteration is what makes abort actually
+    // responsive on long files: between windows we are back in JS and can
+    // stop before the next pipeline call.
+    const merged: TranscriptSegment[] = [];
+    for (const window of windows) {
+      if (abortedRequestIds.has(requestId)) return; // ack already sent by handleAbort
+      const slice = audio.subarray(window.startSample, window.endSample);
+      const output = await activePipeline(slice, asrOptions);
+      if (abortedRequestIds.has(requestId)) return;
+
+      const windowSeconds = window.endSeconds - window.startSeconds;
+      const absolute = toSegments(output, windowSeconds).map((segment) => ({
+        start: segment.start + window.startSeconds,
+        end: segment.end + window.startSeconds,
+        text: segment.text,
+      }));
+      merged.push(...dedupeWindowSegments(absolute, window));
+
+      if (!window.isLast) {
+        send({
+          type: 'partial',
+          requestId,
+          segments: [...merged],
+          processedSeconds: Math.min(window.endSeconds, totalSeconds),
+          totalSeconds,
+        });
+      }
+    }
+
+    send({ type: 'complete', requestId, segments: merged });
   } catch (err) {
     if (!abortedRequestIds.has(requestId)) {
       send({ type: 'error', requestId, code: 'transcribe-failed', message: describeError(err) });
