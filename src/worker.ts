@@ -11,7 +11,7 @@
 
 import type {
   AutomaticSpeechRecognitionOutput,
-  AutomaticSpeechRecognitionPipeline,
+  AutomaticSpeechRecognitionPipelineCallback,
   ProgressInfo,
 } from '@huggingface/transformers';
 import { env, pipeline } from '@huggingface/transformers';
@@ -23,6 +23,7 @@ import {
   type CapabilityReport,
   type DetectionScope,
 } from './backends.js';
+import { attemptBackend } from './backendInit.js';
 import { MODELS, type ModelId } from './models.js';
 import {
   isHostMessage,
@@ -49,7 +50,7 @@ const DEVICE_BY_BACKEND: Record<BackendId, 'webnn' | 'webgpu' | 'wasm'> = {
 };
 
 /** The one ASR pipeline currently loaded, if `init` has completed successfully. */
-let activePipeline: AutomaticSpeechRecognitionPipeline | null = null;
+let activePipeline: AutomaticSpeechRecognitionPipelineCallback | null = null;
 let activeModelId: ModelId | null = null;
 
 /**
@@ -179,7 +180,7 @@ function handleDownloadProgress(requestId: string, modelId: ModelId, info: Progr
   send({ type: 'download-progress', requestId, modelId, loadedBytes, totalBytes });
 }
 
-async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Promise<void> {
+export async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Promise<void> {
   const { requestId, modelId, backendPreference } = message;
   inFlightInitRequestId = requestId;
 
@@ -213,12 +214,16 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
     // actually succeeds.
     //
     // If that one `pipeline()` call still fails (WebNN's documented failure
-    // mode: a context that builds but a graph that doesn't), this worker is
-    // spent — with the bug above, a second `pipeline()` call could not be
-    // trusted. So we report `model-load-failed` *with the failed backend
-    // named* and the host (`EngineClient.init`) resumes the ladder on a
-    // fresh Worker (fresh module state → unpoisoned `wasmInitPromise`),
-    // re-initing with that backend excluded from `backendPreference`.
+    // mode: a context that builds but a graph that doesn't) — or, for an
+    // accelerated backend, builds fine but then fails an output validation
+    // probe against a tiny bundled clip (some real GPUs produce degenerate
+    // "!!!!"-repeated garbage despite a clean graph build; see
+    // backendInit.ts) — this worker is spent: with the bug above, a second
+    // `pipeline()` call could not be trusted. So we report
+    // `model-load-failed` *with the failed backend named* and the host
+    // (`EngineClient.init`) resumes the ladder on a fresh Worker (fresh
+    // module state → unpoisoned `wasmInitPromise`), re-initing with that
+    // backend excluded from `backendPreference`.
     for (const backend of order) {
       if (abortedRequestIds.has(requestId)) break;
       const handshakeOk = await probeBackend(backend);
@@ -226,36 +231,38 @@ async function handleInit(message: Extract<HostMessage, { type: 'init' }>): Prom
         lastError = new Error(`${backend}: real runtime handshake failed`);
         continue;
       }
-      try {
-        // q8 is correct and compact on WASM, but int8 kernels on the WebGPU
-        // execution provider produce garbage tokens at a crawl (verified on
-        // real hardware) — accelerated backends get the per-model float
-        // encoder + q4 decoder config instead (see AcceleratedDtype).
-        // (Inline literal rather than the spec object: TS only assigns fresh
-        // object literals, not interface-typed aliases, to Record dtypes.)
-        const accelerated = MODELS[modelId].acceleratedDtype;
-        const dtype =
-          backend === 'wasm'
-            ? ('q8' as const)
-            : {
-                encoder_model: accelerated.encoder_model,
-                decoder_model_merged: accelerated.decoder_model_merged,
-              };
-        const asr = await pipeline('automatic-speech-recognition', MODELS[modelId].hfRepo, {
-          device: DEVICE_BY_BACKEND[backend],
+      // q8 is correct and compact on WASM, but int8 kernels on the WebGPU
+      // execution provider produce garbage tokens at a crawl (verified on
+      // real hardware) — accelerated backends get the per-model float
+      // encoder + q4 decoder config instead (see AcceleratedDtype).
+      // (Inline literal rather than the spec object: TS only assigns fresh
+      // object literals, not interface-typed aliases, to Record dtypes.)
+      const accelerated = MODELS[modelId].acceleratedDtype;
+      const dtype =
+        backend === 'wasm'
+          ? ('q8' as const)
+          : {
+              encoder_model: accelerated.encoder_model,
+              decoder_model_merged: accelerated.decoder_model_merged,
+            };
+      const result = await attemptBackend(backend, (b) =>
+        pipeline('automatic-speech-recognition', MODELS[modelId].hfRepo, {
+          device: DEVICE_BY_BACKEND[b],
           dtype,
           progress_callback: (info) => handleDownloadProgress(requestId, modelId, info),
-        });
-        // Aborted while the pipeline was building: discard it *before*
-        // installing, or this stale continuation would overwrite whatever a
-        // newer init has since loaded (wrong model for every later
-        // transcribe, with no error surfaced).
+        }),
+      );
+      if (result.ok) {
+        // Aborted while the pipeline was building/validating: discard it
+        // *before* installing, or this stale continuation would overwrite
+        // whatever a newer init has since loaded (wrong model for every
+        // later transcribe, with no error surfaced).
         if (abortedRequestIds.has(requestId)) break;
-        activePipeline = asr;
+        activePipeline = result.asr;
         activeModelId = modelId;
         active = backend;
-      } catch (err) {
-        lastError = err;
+      } else {
+        lastError = result.error;
         failedBackend = backend;
       }
       break;
