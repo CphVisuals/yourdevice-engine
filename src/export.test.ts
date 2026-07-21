@@ -124,4 +124,41 @@ describe('toJson', () => {
     ];
     expect(JSON.parse(toJson(dirty))).toEqual([{ start: 0, end: 1, text: 'x' }]);
   });
+
+  it('includes speaker only when present', () => {
+    const withSpeaker: TranscriptSegment[] = [{ start: 0, end: 1, text: 'x', speaker: 'Alice' }];
+    expect(JSON.parse(toJson(withSpeaker))).toEqual([
+      { start: 0, end: 1, text: 'x', speaker: 'Alice' },
+    ]);
+    // Non-diarized JSON is unchanged (no speaker key).
+    expect(toJson([{ start: 0, end: 1, text: 'x' }])).not.toContain('speaker');
+  });
+});
+
+describe('speaker labels in text exports', () => {
+  const diarized: TranscriptSegment[] = [
+    { start: 0, end: 2, text: 'Hi there.', speaker: 'Alice' },
+    { start: 2, end: 4, text: 'Hello.', speaker: 'Bob' },
+  ];
+
+  it('prefixes SRT cues with "Speaker: "', () => {
+    const srt = toSrt(diarized);
+    expect(srt).toContain('Alice: Hi there.');
+    expect(srt).toContain('Bob: Hello.');
+  });
+
+  it('prefixes VTT cues', () => {
+    expect(toVtt(diarized)).toContain('Alice: Hi there.');
+  });
+
+  it('prefixes TXT lines', () => {
+    expect(toTxt(diarized)).toBe('Alice: Hi there.\nBob: Hello.\n');
+  });
+
+  it('leaves non-diarized exports byte-identical (no prefix)', () => {
+    const plain: TranscriptSegment[] = [{ start: 0, end: 2, text: 'Hi there.' }];
+    expect(toTxt(plain)).toBe('Hi there.\n');
+    // The cue text line is the bare text — no "Name: " prefix.
+    expect(toSrt(plain)).toBe('1\n00:00:00,000 --> 00:00:02,000\nHi there.\n');
+  });
 });

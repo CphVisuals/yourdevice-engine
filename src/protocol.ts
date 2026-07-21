@@ -14,6 +14,13 @@ export interface TranscribeOptions {
   /** Whisper language code (e.g. 'en', 'sv'); omit to auto-detect. */
   language?: string;
   task: 'transcribe' | 'translate';
+  /**
+   * Opt in to speaker diarization ("who spoke"). Off by default: when absent
+   * or false the fast path is byte-identical and the diarization models are
+   * never loaded. When true, the worker labels each segment with a speaker
+   * (see `TranscriptSegment.speaker`).
+   */
+  diarize?: boolean;
 }
 
 export interface TranscriptSegment {
@@ -21,6 +28,13 @@ export interface TranscriptSegment {
   start: number;
   end: number;
   text: string;
+  /**
+   * Anonymous speaker label ("Speaker 1".."Speaker N"), present only when
+   * diarization ran and this segment overlapped a speaker turn. The host may
+   * rename these for display/export; the engine only ever emits the anonymous
+   * form.
+   */
+  speaker?: string;
 }
 
 /**
@@ -59,6 +73,13 @@ export type WorkerMessage =
       segments: TranscriptSegment[];
       processedSeconds: number;
       totalSeconds: number;
+    }
+  | {
+      /** Progress of the (opt-in, post-transcription) diarization pass. */
+      type: 'diarization-progress';
+      requestId: string;
+      processed: number;
+      total: number;
     }
   | { type: 'complete'; requestId: string; segments: TranscriptSegment[] }
   | {
@@ -102,7 +123,8 @@ function isBackendIdArray(value: unknown): value is BackendId[] {
 function isTranscribeOptions(value: unknown): value is TranscribeOptions {
   if (!isRecord(value)) return false;
   if (value.task !== 'transcribe' && value.task !== 'translate') return false;
-  return value.language === undefined || typeof value.language === 'string';
+  if (value.language !== undefined && typeof value.language !== 'string') return false;
+  return value.diarize === undefined || typeof value.diarize === 'boolean';
 }
 
 function isTranscriptSegment(value: unknown): value is TranscriptSegment {
@@ -110,7 +132,8 @@ function isTranscriptSegment(value: unknown): value is TranscriptSegment {
     isRecord(value) &&
     isFiniteNumber(value.start) &&
     isFiniteNumber(value.end) &&
-    typeof value.text === 'string'
+    typeof value.text === 'string' &&
+    (value.speaker === undefined || typeof value.speaker === 'string')
   );
 }
 
@@ -173,6 +196,12 @@ export function isWorkerMessage(value: unknown): value is WorkerMessage {
         isSegmentArray(value.segments) &&
         isFiniteNumber(value.processedSeconds) &&
         isFiniteNumber(value.totalSeconds)
+      );
+    case 'diarization-progress':
+      return (
+        typeof value.requestId === 'string' &&
+        isFiniteNumber(value.processed) &&
+        isFiniteNumber(value.total)
       );
     case 'complete':
       return typeof value.requestId === 'string' && isSegmentArray(value.segments);

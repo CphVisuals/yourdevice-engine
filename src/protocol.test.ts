@@ -62,6 +62,26 @@ describe('isHostMessage', () => {
         options: { task: 'translate', language: 'sv' },
       }),
     ).toBe(true);
+    // Opt-in diarization flag.
+    expect(
+      isHostMessage({
+        type: 'transcribe',
+        requestId: 'r1',
+        audio: new Float32Array(1),
+        options: { task: 'transcribe', diarize: true },
+      }),
+    ).toBe(true);
+  });
+
+  it('rejects transcribe whose diarize flag is not a boolean', () => {
+    expect(
+      isHostMessage({
+        type: 'transcribe',
+        requestId: 'r1',
+        audio: new Float32Array(1),
+        options: { task: 'transcribe', diarize: 'yes' },
+      }),
+    ).toBe(false);
   });
 
   it('rejects transcribe with a bad payload or incomplete options', () => {
@@ -124,7 +144,29 @@ describe('isWorkerMessage', () => {
         totalSeconds: 30,
       }),
     ).toBe(true);
+    expect(
+      isWorkerMessage({ type: 'diarization-progress', requestId: 'r1', processed: 3, total: 10 }),
+    ).toBe(true);
+    expect(
+      isWorkerMessage({ type: 'diarization-progress', requestId: 'r1', processed: 'x', total: 10 }),
+    ).toBe(false);
     expect(isWorkerMessage({ type: 'complete', requestId: 'r1', segments: [] })).toBe(true);
+    // A diarized segment carries an optional string speaker label.
+    expect(
+      isWorkerMessage({
+        type: 'complete',
+        requestId: 'r1',
+        segments: [{ start: 0, end: 1, text: 'hi', speaker: 'Speaker 1' }],
+      }),
+    ).toBe(true);
+    // A non-string speaker is rejected.
+    expect(
+      isWorkerMessage({
+        type: 'complete',
+        requestId: 'r1',
+        segments: [{ start: 0, end: 1, text: 'hi', speaker: 2 }],
+      }),
+    ).toBe(false);
     expect(isWorkerMessage({ type: 'error', code: 'no-backend', message: 'x' })).toBe(true);
     expect(isWorkerMessage({ type: 'error', code: 'worker-failed', message: 'x' })).toBe(true);
     expect(isWorkerMessage({ type: 'error', requestId: 'r1', code: 'aborted', message: '' })).toBe(

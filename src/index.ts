@@ -21,6 +21,15 @@ export {
 export { resampleTo16kMono, type DecodedAudioLike } from './audio.js';
 export { toJson, toSrt, toTxt, toVtt } from './export.js';
 export {
+  assignSpeakers,
+  DEFAULT_DIARIZE_CONFIG,
+  diarize,
+  speakerCount,
+  type DiarizeConfig,
+  type SpeakerTurn,
+} from './diarize.js';
+export { agglomerative, cosineDistance, type Vector } from './clustering.js';
+export {
   EngineClient,
   EngineError,
   type DownloadProgressCallback,

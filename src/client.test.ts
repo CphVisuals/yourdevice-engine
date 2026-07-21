@@ -367,6 +367,28 @@ describe('EngineClient.transcribe', () => {
     expect(partials).toEqual([5, 10]);
   });
 
+  it('invokes onDiarizationProgress for diarization-progress replies', async () => {
+    const worker = new FakeWorker();
+    const client = new EngineClient(() => worker);
+    const progress: [number, number][] = [];
+
+    const transcribePromise = client.transcribe(
+      new Float32Array(16),
+      { task: 'transcribe', diarize: true },
+      { onDiarizationProgress: (processed, total) => progress.push([processed, total]) },
+    );
+    const requestId = worker.posted[0]?.requestId ?? '';
+    worker.emit({ type: 'diarization-progress', requestId, processed: 4, total: 20 });
+    worker.emit({ type: 'diarization-progress', requestId, processed: 20, total: 20 });
+    worker.emit({ type: 'complete', requestId, segments: [] });
+
+    await transcribePromise;
+    expect(progress).toEqual([
+      [4, 20],
+      [20, 20],
+    ]);
+  });
+
   it('rejects with an EngineError on an error reply (error path)', async () => {
     const worker = new FakeWorker();
     const client = new EngineClient(() => worker);

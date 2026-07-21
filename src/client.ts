@@ -75,6 +75,8 @@ export interface TranscribeCallbacks {
     processedSeconds: number,
     totalSeconds: number,
   ) => void;
+  /** Fires during the opt-in diarization pass so long jobs can show progress. */
+  onDiarizationProgress?: (processed: number, total: number) => void;
   /** Fires with this call's requestId before it is posted, so the host can `abort()` it. */
   onRequestStart?: (requestId: string) => void;
 }
@@ -96,6 +98,7 @@ interface PendingTranscribe {
   resolve: (segments: TranscriptSegment[]) => void;
   reject: (err: EngineError) => void;
   onPartial: TranscribeCallbacks['onPartial'];
+  onDiarizationProgress: TranscribeCallbacks['onDiarizationProgress'];
 }
 
 type Pending = PendingInit | PendingTranscribe;
@@ -188,6 +191,7 @@ export class EngineClient {
         resolve,
         reject,
         onPartial: callbacks.onPartial,
+        onDiarizationProgress: callbacks.onDiarizationProgress,
       });
       const message: HostMessage = { type: 'transcribe', requestId, audio, options };
       this.worker.postMessage(message);
@@ -324,6 +328,13 @@ export class EngineClient {
         const pending = this.pending.get(data.requestId);
         if (pending?.kind === 'transcribe') {
           pending.onPartial?.(data.segments, data.processedSeconds, data.totalSeconds);
+        }
+        break;
+      }
+      case 'diarization-progress': {
+        const pending = this.pending.get(data.requestId);
+        if (pending?.kind === 'transcribe') {
+          pending.onDiarizationProgress?.(data.processed, data.total);
         }
         break;
       }

@@ -14,7 +14,13 @@ import type {
   AutomaticSpeechRecognitionPipelineCallback,
   ProgressInfo,
 } from '@huggingface/transformers';
-import { env, pipeline } from '@huggingface/transformers';
+import {
+  AutoModel,
+  AutoModelForAudioFrameClassification,
+  AutoProcessor,
+  env,
+  pipeline,
+} from '@huggingface/transformers';
 import { TARGET_SAMPLE_RATE } from './audio.js';
 import {
   buildCapabilityReport,
@@ -24,6 +30,12 @@ import {
   type DetectionScope,
 } from './backends.js';
 import { attemptBackend } from './backendInit.js';
+import {
+  assignSpeakers,
+  diarize,
+  type EmbeddingRunner,
+  type SegmentationRunner,
+} from './diarize.js';
 import { MODELS, type ModelId } from './models.js';
 import {
   isHostMessage,
@@ -33,6 +45,10 @@ import {
   type WorkerMessage,
 } from './protocol.js';
 import { dedupeWindowSegments, planWindows, WINDOW_SECONDS } from './windows.js';
+
+/** Diarization ONNX models (loaded lazily on the first diarize request). */
+const DIARIZATION_SEG_REPO = 'onnx-community/pyannote-segmentation-3.0';
+const DIARIZATION_EMB_REPO = 'onnx-community/wespeaker-voxceleb-resnet34-LM';
 
 // No COOP/COEP at launch (CLAUDE.md rule 7: no ad-iframe-breaking cross-origin
 // isolation headers), so there is no SharedArrayBuffer — the WASM floor must
@@ -52,6 +68,23 @@ const DEVICE_BY_BACKEND: Record<BackendId, 'webnn' | 'webgpu' | 'wasm'> = {
 /** The one ASR pipeline currently loaded, if `init` has completed successfully. */
 let activePipeline: AutomaticSpeechRecognitionPipelineCallback | null = null;
 let activeModelId: ModelId | null = null;
+/**
+ * The device the ASR pipeline settled on after try-init-with-fallback
+ * (CLAUDE.md rule 6) — including the output-validation ladder in
+ * `attemptBackend`, which falls a garbage-producing accelerated backend off
+ * to WASM. Diarization has no output-validation net of its own, so its
+ * models must be built on this SAME device rather than probing/picking one
+ * independently: if the ASR ended up on WASM because of a bad GPU,
+ * diarization loads on WASM too.
+ */
+let activeDevice: 'webnn' | 'webgpu' | 'wasm' | null = null;
+
+/**
+ * Lazily-built diarization runners (segmentation + embedding), created on the
+ * first `transcribe` with `diarize: true`. Off the default fast path: when
+ * diarization is never requested these models are never downloaded.
+ */
+let diarizer: { runSegmentation: SegmentationRunner; runEmbedding: EmbeddingRunner } | null = null;
 
 /**
  * Prefer a same-origin `/models/` mirror when the host serves one (see the
@@ -260,6 +293,10 @@ export async function handleInit(message: Extract<HostMessage, { type: 'init' }>
         if (abortedRequestIds.has(requestId)) break;
         activePipeline = result.asr;
         activeModelId = modelId;
+        activeDevice = DEVICE_BY_BACKEND[backend];
+        // A model change invalidates nothing about diarization (separate
+        // models), but a backend/device change does — rebuild on next use.
+        diarizer = null;
         active = backend;
       } else {
         lastError = result.error;
@@ -327,6 +364,55 @@ function toSegments(
   });
 }
 
+/**
+ * Builds the diarization runners on first use (segmentation for voice
+ * activity + wespeaker for speaker embeddings), reusing the ASR's SETTLED
+ * device (`activeDevice`, set only once `attemptBackend`'s output-validation
+ * has passed — see the comment on that variable) rather than probing/picking
+ * one independently. q8 on WASM; float on accelerated backends to sidestep
+ * the q8-on-WebGPU garbage class of bug (CLAUDE.md rule 9) — real-hardware
+ * WebGPU verification is still required before merge.
+ */
+async function ensureDiarizer(
+  requestId: string,
+): Promise<{ runSegmentation: SegmentationRunner; runEmbedding: EmbeddingRunner }> {
+  if (diarizer) return diarizer;
+  const device = activeDevice ?? 'wasm';
+  const dtype = device === 'wasm' ? ('q8' as const) : ('fp32' as const);
+  const labelModelId = activeModelId; // progress labelling only
+  const progress_callback = (info: ProgressInfo): void => {
+    if (labelModelId) handleDownloadProgress(requestId, labelModelId, info);
+  };
+
+  const [segModel, segProcessor, embModel, embProcessor] = await Promise.all([
+    AutoModelForAudioFrameClassification.from_pretrained(DIARIZATION_SEG_REPO, {
+      device,
+      dtype,
+      progress_callback,
+    }),
+    AutoProcessor.from_pretrained(DIARIZATION_SEG_REPO),
+    AutoModel.from_pretrained(DIARIZATION_EMB_REPO, { device, dtype, progress_callback }),
+    AutoProcessor.from_pretrained(DIARIZATION_EMB_REPO),
+  ]);
+
+  const runSegmentation: SegmentationRunner = async (windowAudio) => {
+    const inputs = await segProcessor(windowAudio);
+    const output = await segModel(inputs);
+    return output.logits.tolist()[0] as number[][];
+  };
+  const runEmbedding: EmbeddingRunner = async (audio) => {
+    const inputs = await embProcessor(audio);
+    const output = await embModel(inputs);
+    // WeSpeakerResNetModel exposes the vector as `embeddings`; fall back
+    // defensively to keep working if the output key ever changes.
+    const tensor = output.embeddings ?? output.logits ?? Object.values(output)[0];
+    return Float32Array.from(tensor.tolist()[0] as number[]);
+  };
+
+  diarizer = { runSegmentation, runEmbedding };
+  return diarizer;
+}
+
 async function handleTranscribe(
   message: Extract<HostMessage, { type: 'transcribe' }>,
 ): Promise<void> {
@@ -364,7 +450,7 @@ async function handleTranscribe(
     if (windows.length <= 1) {
       const output = await activePipeline(audio, asrOptions);
       if (abortedRequestIds.has(requestId)) return;
-      send({ type: 'complete', requestId, segments: toSegments(output, totalSeconds) });
+      await completeTranscribe(requestId, toSegments(output, totalSeconds), audio, options);
       return;
     }
 
@@ -401,7 +487,7 @@ async function handleTranscribe(
       }
     }
 
-    send({ type: 'complete', requestId, segments: merged });
+    await completeTranscribe(requestId, merged, audio, options);
   } catch (err) {
     if (!abortedRequestIds.has(requestId)) {
       send({ type: 'error', requestId, code: 'transcribe-failed', message: describeError(err) });
@@ -410,6 +496,45 @@ async function handleTranscribe(
     if (inFlightTranscribeRequestId === requestId) inFlightTranscribeRequestId = null;
     abortedRequestIds.delete(requestId);
   }
+}
+
+/**
+ * Sends the final transcript, optionally running diarization first. Off the
+ * fast path: without `options.diarize`, this is a plain `complete` send.
+ * Diarization is best-effort — if it fails, the transcript is returned
+ * without speaker labels rather than failing the whole request.
+ */
+async function completeTranscribe(
+  requestId: string,
+  segments: TranscriptSegment[],
+  audio: Float32Array,
+  options: { diarize?: boolean },
+): Promise<void> {
+  let finalSegments = segments;
+  if (options.diarize) {
+    try {
+      const { runSegmentation, runEmbedding } = await ensureDiarizer(requestId);
+      if (abortedRequestIds.has(requestId)) return;
+      const turns = await diarize(
+        audio,
+        runSegmentation,
+        runEmbedding,
+        undefined,
+        (processed, total) => {
+          // Surface embedding-loop progress so long jobs don't look hung.
+          if (!abortedRequestIds.has(requestId)) {
+            send({ type: 'diarization-progress', requestId, processed, total });
+          }
+        },
+      );
+      if (abortedRequestIds.has(requestId)) return;
+      finalSegments = assignSpeakers(segments, turns);
+    } catch (err) {
+      console.error('diarization failed; returning transcript without speakers', err);
+      finalSegments = segments;
+    }
+  }
+  send({ type: 'complete', requestId, segments: finalSegments });
 }
 
 function handleAbort(message: Extract<HostMessage, { type: 'abort' }>): void {
