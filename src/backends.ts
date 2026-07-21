@@ -15,6 +15,8 @@ export interface CapabilityReport {
   detected: Record<BackendId, boolean>;
   active: BackendId | null;
   deviceMemoryGb: number | null;
+  /** Phone/tablet — used to pick a lighter default model (see pickDefaultModel). */
+  isMobile: boolean;
 }
 
 /** The subset of globals the detector reads, injectable for tests. */
@@ -23,8 +25,24 @@ export interface DetectionScope {
     ml?: unknown;
     gpu?: unknown;
     deviceMemory?: number;
+    userAgent?: string;
+    /** Chromium's client hints; `mobile` is the cleanest phone signal. */
+    userAgentData?: { mobile?: boolean };
   };
   WebAssembly?: unknown;
+}
+
+/**
+ * Whether this is a phone/tablet. Prefers Chromium's `userAgentData.mobile`
+ * (covers Android Chrome — where WebGPU is flaky, so mobile lands on the WASM
+ * floor and needs a lighter model); falls back to a user-agent sniff for
+ * Safari/Firefox which don't expose client hints.
+ */
+export function detectMobile(scope: DetectionScope): boolean {
+  const nav = scope.navigator;
+  if (nav?.userAgentData?.mobile === true) return true;
+  const ua = typeof nav?.userAgent === 'string' ? nav.userAgent : '';
+  return /iPhone|iPad|iPod|Android|Mobile/i.test(ua);
 }
 
 export function detectBackends(scope: DetectionScope): Record<BackendId, boolean> {
@@ -41,6 +59,7 @@ export function buildCapabilityReport(scope: DetectionScope): CapabilityReport {
     detected: detectBackends(scope),
     active: null,
     deviceMemoryGb: typeof memory === 'number' && memory > 0 ? memory : null,
+    isMobile: detectMobile(scope),
   };
 }
 
@@ -61,12 +80,19 @@ export function planBackendOrder(
 }
 
 /**
- * Default model choice. `whisper-base` is the smallest multilingual model we
- * ship, so it is the default everywhere; only clearly capable devices (a
- * detected GPU/NPU path and >= 8 GB reported memory) default up to
- * `whisper-small`. The UI always offers an explicit override.
+ * Default model choice. `whisper-base` (the smaller, faster multilingual model)
+ * is the default everywhere except clearly capable *desktops*, which default up
+ * to `whisper-small` for quality. The UI always offers an explicit override.
+ *
+ * Phones are forced to `whisper-base` regardless of the memory signal: WebGPU
+ * is flaky on mobile so phones usually run the WASM floor, where whisper-small
+ * is slower than real-time (benchmarked ~0.85× on a flagship OnePlus 13),
+ * whereas whisper-base runs comfortably faster. `navigator.deviceMemory` caps
+ * at 8 in every browser, so a 12 GB phone otherwise looks like an 8 GB desktop
+ * and would wrongly get the heavy model.
  */
 export function pickDefaultModel(report: CapabilityReport): ModelId {
+  if (report.isMobile) return 'whisper-base';
   const accelerated = report.detected.webgpu || report.detected.webnn;
   if (accelerated && report.deviceMemoryGb !== null && report.deviceMemoryGb >= 8) {
     return 'whisper-small';

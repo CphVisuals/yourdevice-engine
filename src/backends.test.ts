@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCapabilityReport,
   detectBackends,
+  detectMobile,
   pickDefaultModel,
   planBackendOrder,
 } from './backends.js';
@@ -100,5 +101,31 @@ describe('pickDefaultModel', () => {
   it('stays conservative when device memory is unknown', () => {
     const unknownMemory = buildCapabilityReport({ navigator: { gpu: {} }, WebAssembly: {} });
     expect(pickDefaultModel(unknownMemory)).toBe('whisper-base');
+  });
+
+  it('forces whisper-base on mobile even when it looks capable', () => {
+    // A 12 GB phone reports deviceMemory 8 (browsers cap it) + gpu present —
+    // it would otherwise wrongly get the heavy model. isMobile overrides.
+    const phone = buildCapabilityReport({
+      navigator: { gpu: {}, deviceMemory: 8, userAgentData: { mobile: true } },
+      WebAssembly: {},
+    });
+    expect(phone.isMobile).toBe(true);
+    expect(pickDefaultModel(phone)).toBe('whisper-base');
+  });
+});
+
+describe('detectMobile', () => {
+  it('trusts Chromium userAgentData.mobile', () => {
+    expect(detectMobile({ navigator: { userAgentData: { mobile: true } } })).toBe(true);
+    expect(detectMobile({ navigator: { userAgentData: { mobile: false } } })).toBe(false);
+  });
+
+  it('falls back to a user-agent sniff for browsers without client hints', () => {
+    expect(detectMobile({ navigator: { userAgent: 'iPhone; CPU iPhone OS' } })).toBe(true);
+    expect(detectMobile({ navigator: { userAgent: 'Android 14; Mobile' } })).toBe(true);
+    expect(detectMobile({ navigator: { userAgent: 'X11; Linux x86_64' } })).toBe(false);
+    expect(detectMobile({ navigator: {} })).toBe(false);
+    expect(detectMobile({})).toBe(false);
   });
 });

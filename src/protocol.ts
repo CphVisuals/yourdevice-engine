@@ -126,7 +126,7 @@ function isCapabilityReport(value: unknown): value is CapabilityReport {
   const activeOk =
     value.active === null || (typeof value.active === 'string' && BACKEND_IDS.has(value.active));
   const memoryOk = value.deviceMemoryGb === null || isFiniteNumber(value.deviceMemoryGb);
-  return activeOk && memoryOk;
+  return activeOk && memoryOk && typeof value.isMobile === 'boolean';
 }
 
 export function isHostMessage(value: unknown): value is HostMessage {

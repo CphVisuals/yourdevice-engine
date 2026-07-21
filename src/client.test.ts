@@ -71,6 +71,7 @@ const capabilities = {
   detected: { webnn: false, webgpu: true, wasm: true },
   active: 'webgpu' as const,
   deviceMemoryGb: 8,
+  isMobile: false,
 };
 
 describe('EngineClient.init', () => {

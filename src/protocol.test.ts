@@ -5,6 +5,7 @@ const capabilities = {
   detected: { webnn: false, webgpu: true, wasm: true },
   active: null,
   deviceMemoryGb: 8,
+  isMobile: false,
 };
 
 describe('isHostMessage', () => {
