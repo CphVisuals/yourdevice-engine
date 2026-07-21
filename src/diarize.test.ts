@@ -378,6 +378,43 @@ describe('diarize (speaker-count accuracy on synthetic fixtures)', () => {
     expect(turns.every((t) => t.end > t.start)).toBe(true);
     expect(turns[0]!.speaker).toBe('Speaker 1');
   });
+
+  it('stops the embedding loop promptly on abort (does not drain every window)', async () => {
+    const audio = buildAudio([
+      [1, 5],
+      [2, 5],
+      [1, 5],
+      [2, 5],
+    ]);
+    // Baseline: how many embeddings a full, un-aborted run performs.
+    let full = 0;
+    await diarize(
+      audio,
+      fakeSegmentation,
+      async (a) => {
+        full++;
+        return fakeEmbedding(a);
+      },
+      CONFIG,
+    );
+    expect(full).toBeGreaterThan(2);
+
+    // Aborted run: cancel as soon as the first embedding has been computed.
+    let calls = 0;
+    const turns = await diarize(
+      audio,
+      fakeSegmentation,
+      async (a) => {
+        calls++;
+        return fakeEmbedding(a);
+      },
+      CONFIG,
+      undefined,
+      () => calls >= 1,
+    );
+    expect(turns).toEqual([]); // aborted → no turns (caller discards)
+    expect(calls).toBeLessThan(full); // stopped early, didn't embed every window
+  });
 });
 
 describe('assignSpeakers', () => {

@@ -383,6 +383,13 @@ export async function diarize(
   runEmbedding: EmbeddingRunner,
   config: DiarizeConfig = DEFAULT_DIARIZE_CONFIG,
   onProgress?: DiarizationProgress,
+  /**
+   * Polled before each (sequential, model-bound) window so a host cancel can
+   * stop the loop promptly instead of draining the whole file. On abort the
+   * pipeline returns no turns — the caller, which already knows it aborted,
+   * discards the result rather than emitting a speaker-less transcript.
+   */
+  shouldAbort?: () => boolean,
 ): Promise<SpeakerTurn[]> {
   const { sampleRate } = config;
 
@@ -391,6 +398,7 @@ export async function diarize(
   const vadWinSamples = Math.round(config.vadWindowSec * sampleRate);
   const rawRegions: TimeRegion[] = [];
   for (let start = 0; start < audio.length; start += vadWinSamples) {
+    if (shouldAbort?.()) return [];
     const end = Math.min(start + vadWinSamples, audio.length);
     const windowAudio = audio.subarray(start, end);
     const logits = await runSegmentation(windowAudio);
@@ -416,6 +424,7 @@ export async function diarize(
   const embeddings: Float32Array[] = [];
   const embWindows: { startSec: number; endSec: number }[] = [];
   for (const win of plan) {
+    if (shouldAbort?.()) return [];
     // Gate against the window's ACTUAL length, not the nominal one: the final
     // window is clamped shorter, and a fixed 3 s threshold would drop its
     // qualifying trailing speech (leaving the last segments unlabeled).

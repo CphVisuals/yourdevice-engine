@@ -373,6 +373,28 @@ function toSegments(
  * the q8-on-WebGPU garbage class of bug (CLAUDE.md rule 9) — real-hardware
  * WebGPU verification is still required before merge.
  */
+/**
+ * Retry a transient async op with linear backoff. The diarization model files
+ * are fetched live on first use; under network contention (or several tabs at
+ * once) a fetch can hiccup, and without a retry the whole opt-in feature fails
+ * silently for that run. Successful `from_pretrained` calls are cached, so a
+ * retry re-resolves the already-loaded pieces cheaply.
+ */
+async function withRetry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 500): Promise<T> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastError = err;
+      if (attempt < attempts - 1) {
+        await new Promise((resolve) => setTimeout(resolve, delayMs * (attempt + 1)));
+      }
+    }
+  }
+  throw lastError;
+}
+
 async function ensureDiarizer(
   requestId: string,
 ): Promise<{ runSegmentation: SegmentationRunner; runEmbedding: EmbeddingRunner }> {
@@ -384,16 +406,18 @@ async function ensureDiarizer(
     if (labelModelId) handleDownloadProgress(requestId, labelModelId, info);
   };
 
-  const [segModel, segProcessor, embModel, embProcessor] = await Promise.all([
-    AutoModelForAudioFrameClassification.from_pretrained(DIARIZATION_SEG_REPO, {
-      device,
-      dtype,
-      progress_callback,
-    }),
-    AutoProcessor.from_pretrained(DIARIZATION_SEG_REPO),
-    AutoModel.from_pretrained(DIARIZATION_EMB_REPO, { device, dtype, progress_callback }),
-    AutoProcessor.from_pretrained(DIARIZATION_EMB_REPO),
-  ]);
+  const [segModel, segProcessor, embModel, embProcessor] = await withRetry(() =>
+    Promise.all([
+      AutoModelForAudioFrameClassification.from_pretrained(DIARIZATION_SEG_REPO, {
+        device,
+        dtype,
+        progress_callback,
+      }),
+      AutoProcessor.from_pretrained(DIARIZATION_SEG_REPO),
+      AutoModel.from_pretrained(DIARIZATION_EMB_REPO, { device, dtype, progress_callback }),
+      AutoProcessor.from_pretrained(DIARIZATION_EMB_REPO),
+    ]),
+  );
 
   const runSegmentation: SegmentationRunner = async (windowAudio) => {
     const inputs = await segProcessor(windowAudio);
@@ -526,6 +550,8 @@ async function completeTranscribe(
             send({ type: 'diarization-progress', requestId, processed, total });
           }
         },
+        // Stop the (minutes-long on WASM) embedding loop promptly on cancel.
+        () => abortedRequestIds.has(requestId),
       );
       if (abortedRequestIds.has(requestId)) return;
       finalSegments = assignSpeakers(segments, turns);
