@@ -17,6 +17,12 @@ export interface CapabilityReport {
   deviceMemoryGb: number | null;
   /** Phone/tablet — used to pick a lighter default model (see pickDefaultModel). */
   isMobile: boolean;
+  /**
+   * iOS/iPadOS specifically. Every browser there is WebKit under a tight
+   * per-tab memory cap that OOM-reloads the tab on whisper-base — so iOS gets
+   * the smallest model regardless of the memory signal (see pickDefaultModel).
+   */
+  isIOS: boolean;
 }
 
 /** The subset of globals the detector reads, injectable for tests. */
@@ -26,6 +32,8 @@ export interface DetectionScope {
     gpu?: unknown;
     deviceMemory?: number;
     userAgent?: string;
+    /** iPadOS 13+ reports a desktop UA; touch points disambiguate it. */
+    maxTouchPoints?: number;
     /** Chromium's client hints; `mobile` is the cleanest phone signal. */
     userAgentData?: { mobile?: boolean };
   };
@@ -45,6 +53,19 @@ export function detectMobile(scope: DetectionScope): boolean {
   return /iPhone|iPad|iPod|Android|Mobile/i.test(ua);
 }
 
+/**
+ * Whether this is iOS/iPadOS. Matches the iPhone/iPad/iPod user-agent, plus
+ * iPadOS 13+ which masquerades as desktop Safari ("Macintosh" UA) but is
+ * given away by its touch support. All iOS browsers are WebKit, so this is a
+ * platform test, not a browser test.
+ */
+export function detectIOS(scope: DetectionScope): boolean {
+  const nav = scope.navigator;
+  const ua = typeof nav?.userAgent === 'string' ? nav.userAgent : '';
+  if (/iPhone|iPad|iPod/i.test(ua)) return true;
+  return /Macintosh/i.test(ua) && typeof nav?.maxTouchPoints === 'number' && nav.maxTouchPoints > 1;
+}
+
 export function detectBackends(scope: DetectionScope): Record<BackendId, boolean> {
   return {
     webnn: scope.navigator?.ml != null,
@@ -60,6 +81,7 @@ export function buildCapabilityReport(scope: DetectionScope): CapabilityReport {
     active: null,
     deviceMemoryGb: typeof memory === 'number' && memory > 0 ? memory : null,
     isMobile: detectMobile(scope),
+    isIOS: detectIOS(scope),
   };
 }
 
@@ -84,14 +106,21 @@ export function planBackendOrder(
  * is the default everywhere except clearly capable *desktops*, which default up
  * to `whisper-small` for quality. The UI always offers an explicit override.
  *
- * Phones are forced to `whisper-base` regardless of the memory signal: WebGPU
- * is flaky on mobile so phones usually run the WASM floor, where whisper-small
- * is slower than real-time (benchmarked ~0.85× on a flagship OnePlus 13),
- * whereas whisper-base runs comfortably faster. `navigator.deviceMemory` caps
- * at 8 in every browser, so a 12 GB phone otherwise looks like an 8 GB desktop
- * and would wrongly get the heavy model.
+ * iOS/iPadOS is forced to `whisper-tiny`: WebKit's per-tab memory cap
+ * OOM-reloads the tab on whisper-base (verified on iPhone Safari 2026-07),
+ * whereas tiny transcribes reliably. It's the working floor for the platform,
+ * not a quality choice — the picker still offers heavier models for anyone who
+ * wants to try.
+ *
+ * Other phones are forced to `whisper-base` regardless of the memory signal:
+ * WebGPU is flaky on mobile so phones usually run the WASM floor, where
+ * whisper-small is slower than real-time (benchmarked ~0.85× on a flagship
+ * OnePlus 13), whereas whisper-base runs comfortably faster.
+ * `navigator.deviceMemory` caps at 8 in every browser, so a 12 GB phone
+ * otherwise looks like an 8 GB desktop and would wrongly get the heavy model.
  */
 export function pickDefaultModel(report: CapabilityReport): ModelId {
+  if (report.isIOS) return 'whisper-tiny';
   if (report.isMobile) return 'whisper-base';
   const accelerated = report.detected.webgpu || report.detected.webnn;
   if (accelerated && report.deviceMemoryGb !== null && report.deviceMemoryGb >= 8) {

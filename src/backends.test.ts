@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import {
   buildCapabilityReport,
   detectBackends,
+  detectIOS,
   detectMobile,
   pickDefaultModel,
   planBackendOrder,
@@ -112,6 +113,42 @@ describe('pickDefaultModel', () => {
     });
     expect(phone.isMobile).toBe(true);
     expect(pickDefaultModel(phone)).toBe('whisper-base');
+  });
+
+  it('forces whisper-tiny on iOS (WebKit memory cap crashes on larger models)', () => {
+    const iphone = buildCapabilityReport({
+      navigator: { userAgent: 'iPhone; CPU iPhone OS 17_0 like Mac OS X' },
+      WebAssembly: {},
+    });
+    expect(iphone.isIOS).toBe(true);
+    // isIOS wins over the generic mobile → whisper-base rule.
+    expect(iphone.isMobile).toBe(true);
+    expect(pickDefaultModel(iphone)).toBe('whisper-tiny');
+  });
+});
+
+describe('detectIOS', () => {
+  it('matches iPhone/iPad/iPod user agents', () => {
+    expect(detectIOS({ navigator: { userAgent: 'iPhone; CPU iPhone OS 17_0' } })).toBe(true);
+    expect(detectIOS({ navigator: { userAgent: 'iPad; CPU OS 16_0' } })).toBe(true);
+    expect(detectIOS({ navigator: { userAgent: 'iPod touch' } })).toBe(true);
+  });
+
+  it('detects iPadOS 13+ masquerading as desktop Safari via touch points', () => {
+    // iPadOS reports a "Macintosh" UA; only maxTouchPoints gives it away.
+    expect(
+      detectIOS({ navigator: { userAgent: 'Macintosh; Intel Mac OS X', maxTouchPoints: 5 } }),
+    ).toBe(true);
+    // A real Mac (trackpad, not touch) must NOT be treated as iOS.
+    expect(
+      detectIOS({ navigator: { userAgent: 'Macintosh; Intel Mac OS X', maxTouchPoints: 0 } }),
+    ).toBe(false);
+  });
+
+  it('is false for Android and desktop', () => {
+    expect(detectIOS({ navigator: { userAgent: 'Android 14; Mobile' } })).toBe(false);
+    expect(detectIOS({ navigator: { userAgent: 'X11; Linux x86_64' } })).toBe(false);
+    expect(detectIOS({})).toBe(false);
   });
 });
 
