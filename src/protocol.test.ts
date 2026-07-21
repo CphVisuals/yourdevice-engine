@@ -6,7 +6,6 @@ const capabilities = {
   active: null,
   deviceMemoryGb: 8,
   isMobile: false,
-  isIOS: false,
 };
 
 describe('isHostMessage', () => {

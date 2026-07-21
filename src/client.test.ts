@@ -72,7 +72,6 @@ const capabilities = {
   active: 'webgpu' as const,
   deviceMemoryGb: 8,
   isMobile: false,
-  isIOS: false,
 };
 
 describe('EngineClient.init', () => {

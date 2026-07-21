@@ -60,10 +60,7 @@ export const MODELS: Record<ModelId, ModelSpec> = {
     hfRepo: 'onnx-community/whisper-tiny',
     approxSizeMb: 40,
     multilingual: true,
-    label: 'Lite (all languages)',
-    // Hidden from the picker by default (too low-quality to offer desktops),
-    // but it's the iOS default (pickDefaultModel) and the picker always shows
-    // the active model — so iPhone users see and can keep "Lite".
+    label: 'Tiny (testing)',
     hidden: true,
     acceleratedDtype: { encoder_model: 'fp32', decoder_model_merged: 'q4' },
   },
