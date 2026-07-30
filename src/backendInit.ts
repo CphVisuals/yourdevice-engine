@@ -27,19 +27,17 @@
  */
 import type {
   AutomaticSpeechRecognitionOutput,
-  AutomaticSpeechRecognitionPipelineCallback,
+  AutomaticSpeechRecognitionPipeline,
 } from '@huggingface/transformers';
 import type { BackendId } from './backends.js';
 import { isDegenerateOutput } from './degenerateOutput.js';
 import { getValidationClip } from './validationClip.js';
 
 /** Builds (or rejects while building) a pipeline for one backend candidate. */
-export type PipelineBuilder = (
-  backend: BackendId,
-) => Promise<AutomaticSpeechRecognitionPipelineCallback>;
+export type PipelineBuilder = (backend: BackendId) => Promise<AutomaticSpeechRecognitionPipeline>;
 
 export type BackendAttemptResult =
-  { ok: true; asr: AutomaticSpeechRecognitionPipelineCallback } | { ok: false; error: unknown };
+  { ok: true; asr: AutomaticSpeechRecognitionPipeline } | { ok: false; error: unknown };
 
 function firstResult(
   output: AutomaticSpeechRecognitionOutput | AutomaticSpeechRecognitionOutput[],
@@ -59,7 +57,7 @@ export async function attemptBackend(
   buildPipeline: PipelineBuilder,
   clip: Float32Array = getValidationClip(),
 ): Promise<BackendAttemptResult> {
-  let asr: AutomaticSpeechRecognitionPipelineCallback;
+  let asr: AutomaticSpeechRecognitionPipeline;
   try {
     asr = await buildPipeline(backend);
   } catch (error) {

@@ -31,7 +31,7 @@
     "build": "tsc -p tsconfig.build.json"
   },
   "dependencies": {
-    "@huggingface/transformers": "^3.8.1"
+    "@huggingface/transformers": "^4.2.0"
   },
   "devDependencies": {
     "typescript": "^5.8.0",

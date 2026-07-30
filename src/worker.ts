@@ -11,7 +11,7 @@
 
 import type {
   AutomaticSpeechRecognitionOutput,
-  AutomaticSpeechRecognitionPipelineCallback,
+  AutomaticSpeechRecognitionPipeline,
   ProgressInfo,
 } from '@huggingface/transformers';
 import {
@@ -66,7 +66,7 @@ const DEVICE_BY_BACKEND: Record<BackendId, 'webnn' | 'webgpu' | 'wasm'> = {
 };
 
 /** The one ASR pipeline currently loaded, if `init` has completed successfully. */
-let activePipeline: AutomaticSpeechRecognitionPipelineCallback | null = null;
+let activePipeline: AutomaticSpeechRecognitionPipeline | null = null;
 let activeModelId: ModelId | null = null;
 /**
  * The device the ASR pipeline settled on after try-init-with-fallback
@@ -78,6 +78,15 @@ let activeModelId: ModelId | null = null;
  * diarization loads on WASM too.
  */
 let activeDevice: 'webnn' | 'webgpu' | 'wasm' | null = null;
+
+/**
+ * Whether the WebGPU adapter this worker probed exposes the `shader-f16`
+ * feature. Transformers.js v4's WebGPU execution provider hard-requires it to
+ * load fp16 weights — without it, an fp16 encoder fails session creation. Set
+ * during `probeBackend('webgpu')`; read in `handleInit` to downgrade an fp16
+ * encoder to fp32 on adapters that lack the feature. (Irrelevant to WebNN/WASM.)
+ */
+let webgpuSupportsF16 = false;
 
 /**
  * Lazily-built diarization runners (segmentation + embedding), created on the
@@ -175,7 +184,14 @@ async function probeBackend(backend: BackendId): Promise<boolean> {
       const gpu = (navigator as unknown as { gpu?: { requestAdapter(): Promise<unknown> } }).gpu;
       if (!gpu) return false;
       try {
-        return (await gpu.requestAdapter()) != null;
+        const adapter = (await gpu.requestAdapter()) as {
+          features?: { has(name: string): boolean };
+        } | null;
+        if (adapter == null) return false;
+        // v4's WebGPU EP needs `shader-f16` to load fp16 weights; remember
+        // whether this adapter has it so handleInit can pick a loadable dtype.
+        webgpuSupportsF16 = adapter.features?.has('shader-f16') ?? false;
+        return true;
       } catch {
         return false;
       }
@@ -271,11 +287,18 @@ export async function handleInit(message: Extract<HostMessage, { type: 'init' }>
       // (Inline literal rather than the spec object: TS only assigns fresh
       // object literals, not interface-typed aliases, to Record dtypes.)
       const accelerated = MODELS[modelId].acceleratedDtype;
+      // v4/ORT-1.26: an fp16 encoder only loads on a WebGPU adapter that
+      // exposes `shader-f16` (set in probeBackend). Downgrade to fp32 when it
+      // doesn't, rather than letting session creation hard-fail.
+      const encoderDtype =
+        backend === 'webgpu' && accelerated.encoder_model === 'fp16' && !webgpuSupportsF16
+          ? ('fp32' as const)
+          : accelerated.encoder_model;
       const dtype =
         backend === 'wasm'
           ? ('q8' as const)
           : {
-              encoder_model: accelerated.encoder_model,
+              encoder_model: encoderDtype,
               decoder_model_merged: accelerated.decoder_model_merged,
             };
       const result = await attemptBackend(backend, (b) =>

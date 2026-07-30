@@ -1,10 +1,16 @@
-import type { AutomaticSpeechRecognitionPipelineCallback } from '@huggingface/transformers';
+import type { AutomaticSpeechRecognitionPipeline } from '@huggingface/transformers';
 import { describe, expect, it, vi } from 'vitest';
 import { attemptBackend, type PipelineBuilder } from './backendInit.js';
 
-/** A fake pipeline builder that resolves to an injected fake ASR runner. */
-function fakeBuilder(asr: AutomaticSpeechRecognitionPipelineCallback): PipelineBuilder {
-  return vi.fn().mockResolvedValue(asr);
+/**
+ * A fake pipeline builder that resolves to an injected fake ASR runner.
+ * `asr` is a bare `vi.fn()` callable — the engine only ever *calls* the
+ * pipeline, so we cast the mock to the library's (now class-shaped in v4)
+ * pipeline type at this single injection boundary rather than stubbing the
+ * class's dozen private members.
+ */
+function fakeBuilder(asr: unknown): PipelineBuilder {
+  return vi.fn().mockResolvedValue(asr as AutomaticSpeechRecognitionPipeline);
 }
 
 const CLIP = new Float32Array([0.1, -0.1, 0.2, -0.2]);
