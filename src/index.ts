@@ -29,6 +29,7 @@ export {
   type SpeakerTurn,
 } from './diarize.js';
 export { agglomerative, cosineDistance, type Vector } from './clustering.js';
+export { distinctNgramRatio, isDegenerateGeneration } from './generationHealth.js';
 export {
   EngineClient,
   EngineError,
