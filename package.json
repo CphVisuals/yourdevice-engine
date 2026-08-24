@@ -1,15 +1,50 @@
 {
   "name": "@yourdevice/engine",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Local-first, in-browser speech-to-text engine. Whisper on WebGPU/WASM (WebNN as progressive enhancement) — audio never leaves the device.",
   "license": "MIT",
+  "author": "Wangle Media (https://yourdevice.app)",
+  "homepage": "https://yourdevice.app/transcribe",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/CphVisuals/yourdevice-engine.git"
+  },
+  "bugs": {
+    "url": "https://github.com/CphVisuals/yourdevice-engine/issues"
+  },
+  "keywords": [
+    "whisper",
+    "speech-to-text",
+    "transcription",
+    "asr",
+    "diarization",
+    "webgpu",
+    "webnn",
+    "wasm",
+    "onnx",
+    "transformers.js",
+    "browser",
+    "local-first",
+    "offline",
+    "privacy",
+    "srt",
+    "vtt"
+  ],
   "type": "module",
+  "sideEffects": [
+    "./src/worker.ts",
+    "./dist/worker.js"
+  ],
   "exports": {
     ".": "./src/index.ts",
     "./worker": "./src/worker.ts",
     "./generationHealth": "./src/generationHealth.ts"
   },
   "publishConfig": {
+    "access": "public",
+    "types": "./dist/index.d.ts",
+    "module": "./dist/index.js",
+    "main": "./dist/index.js",
     "exports": {
       ".": {
         "types": "./dist/index.d.ts",
@@ -27,13 +62,17 @@
   },
   "files": [
     "dist",
+    "src",
+    "!src/**/*.test.ts",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
-    "build": "tsc -p tsconfig.build.json"
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm run build",
+    "prepublishOnly": "node ./scripts/assert-pnpm-publish.mjs"
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0"
