@@ -65,9 +65,27 @@ const DEVICE_BY_BACKEND: Record<BackendId, 'webnn' | 'webgpu' | 'wasm'> = {
   wasm: 'wasm',
 };
 
-/** The one ASR pipeline currently loaded, if `init` has completed successfully. */
+/**
+ * The one ASR pipeline currently loaded, if `init` has completed successfully
+ * AND it has not been released to make room for diarization (see
+ * `releaseAsrPipeline`). `null` with a non-null `rebuildPipeline` means
+ * "initialized, currently unloaded" — not "not initialized".
+ */
 let activePipeline: AutomaticSpeechRecognitionPipeline | null = null;
 let activeModelId: ModelId | null = null;
+/**
+ * Rebuilds the ASR pipeline with the exact model, device and dtype `handleInit`
+ * settled on. Set once init succeeds; the only thing that makes releasing the
+ * pipeline mid-session safe.
+ *
+ * A rebuild is a local session build, not a download: the weights are in Cache
+ * Storage by the time this can be called. It deliberately does NOT replay
+ * `attemptBackend`'s validation clip — that ladder already ran on this device,
+ * for this backend, and re-running an inference to re-learn its answer would
+ * cost the user seconds per file.
+ */
+let rebuildPipeline: ((requestId: string) => Promise<AutomaticSpeechRecognitionPipeline>) | null =
+  null;
 /**
  * The device the ASR pipeline settled on after try-init-with-fallback
  * (CLAUDE.md rule 6) — including the output-validation ladder in
@@ -92,8 +110,54 @@ let webgpuSupportsF16 = false;
  * Lazily-built diarization runners (segmentation + embedding), created on the
  * first `transcribe` with `diarize: true`. Off the default fast path: when
  * diarization is never requested these models are never downloaded.
+ *
+ * Carries its own `release` so `releaseDiarizer` can free both ONNX sessions
+ * without knowing what built them.
  */
-let diarizer: { runSegmentation: SegmentationRunner; runEmbedding: EmbeddingRunner } | null = null;
+let diarizer: {
+  runSegmentation: SegmentationRunner;
+  runEmbedding: EmbeddingRunner;
+  release: () => Promise<void>;
+} | null = null;
+
+/**
+ * Free the ASR pipeline's ONNX sessions, keeping the session *initialized*:
+ * `rebuildPipeline` survives, so the next transcribe rebuilds it transparently.
+ *
+ * Why this exists: transcription and diarization are strictly sequential
+ * phases, and nothing used to unload anything. A diarized run therefore held
+ * Whisper, pyannote segmentation and the wespeaker embedding model in memory at
+ * the same time — three graphs for two phases, one of which was already
+ * finished. On a desktop that is waste; on a phone it is a per-tab memory
+ * ceiling, and iOS Safari enforces that ceiling by silently reloading the tab
+ * (no error, no crash handler, the recording gone). Peak memory is now
+ * max(whisper, diarization) rather than their sum.
+ *
+ * Never throws: a failed dispose still drops our reference, and the pipeline is
+ * unreachable afterwards either way.
+ */
+export async function releaseAsrPipeline(): Promise<void> {
+  const released = activePipeline;
+  activePipeline = null;
+  if (released === null) return;
+  try {
+    await released.dispose();
+  } catch (err) {
+    console.error('engine worker: disposing the ASR pipeline failed', err);
+  }
+}
+
+/** Free both diarization models. Called when a diarized run ends, however it ends. */
+export async function releaseDiarizer(): Promise<void> {
+  const released = diarizer;
+  diarizer = null;
+  if (released === null) return;
+  try {
+    await released.release();
+  } catch (err) {
+    console.error('engine worker: disposing the diarization models failed', err);
+  }
+}
 
 /**
  * Prefer a same-origin `/models/` mirror when the host serves one (see the
@@ -301,25 +365,41 @@ export async function handleInit(message: Extract<HostMessage, { type: 'init' }>
               encoder_model: encoderDtype,
               decoder_model_merged: accelerated.decoder_model_merged,
             };
-      const result = await attemptBackend(backend, (b) =>
+      // One builder, used twice: once now, through the validation ladder, and
+      // again later if `releaseAsrPipeline` has freed the pipeline to make room
+      // for diarization. `reportingTo` is the requestId the download progress
+      // is attributed to, so a rebuild reports under the transcribe that
+      // triggered it rather than under this long-finished init.
+      const buildPipeline = (
+        b: BackendId,
+        reportingTo: string,
+      ): Promise<AutomaticSpeechRecognitionPipeline> =>
         pipeline('automatic-speech-recognition', MODELS[modelId].hfRepo, {
           device: DEVICE_BY_BACKEND[b],
           dtype,
-          progress_callback: (info) => handleDownloadProgress(requestId, modelId, info),
-        }),
-      );
+          progress_callback: (info) => handleDownloadProgress(reportingTo, modelId, info),
+        });
+      const result = await attemptBackend(backend, (b) => buildPipeline(b, requestId));
       if (result.ok) {
         // Aborted while the pipeline was building/validating: discard it
         // *before* installing, or this stale continuation would overwrite
         // whatever a newer init has since loaded (wrong model for every
-        // later transcribe, with no error surfaced).
-        if (abortedRequestIds.has(requestId)) break;
+        // later transcribe, with no error surfaced). Dispose it on the way
+        // out — an abandoned pipeline is a whole model's worth of sessions
+        // that nothing can ever reach again.
+        if (abortedRequestIds.has(requestId)) {
+          await result.asr.dispose().catch(() => {});
+          break;
+        }
         activePipeline = result.asr;
         activeModelId = modelId;
         activeDevice = DEVICE_BY_BACKEND[backend];
+        rebuildPipeline = (reportingTo) => buildPipeline(backend, reportingTo);
         // A model change invalidates nothing about diarization (separate
         // models), but a backend/device change does — rebuild on next use.
-        diarizer = null;
+        // Released rather than dropped: dropping the reference leaves both
+        // ONNX sessions alive with nothing able to free them.
+        await releaseDiarizer();
         active = backend;
       } else {
         lastError = result.error;
@@ -418,9 +498,11 @@ async function withRetry<T>(fn: () => Promise<T>, attempts = 3, delayMs = 500): 
   throw lastError;
 }
 
-async function ensureDiarizer(
-  requestId: string,
-): Promise<{ runSegmentation: SegmentationRunner; runEmbedding: EmbeddingRunner }> {
+async function ensureDiarizer(requestId: string): Promise<{
+  runSegmentation: SegmentationRunner;
+  runEmbedding: EmbeddingRunner;
+  release: () => Promise<void>;
+}> {
   if (diarizer) return diarizer;
   const device = activeDevice ?? 'wasm';
   const dtype = device === 'wasm' ? ('q8' as const) : ('fp32' as const);
@@ -456,16 +538,40 @@ async function ensureDiarizer(
     return Float32Array.from(tensor.tolist()[0] as number[]);
   };
 
-  diarizer = { runSegmentation, runEmbedding };
+  const release = async (): Promise<void> => {
+    await Promise.all([segModel.dispose(), embModel.dispose()]);
+  };
+
+  diarizer = { runSegmentation, runEmbedding, release };
   return diarizer;
 }
 
-async function handleTranscribe(
+/**
+ * The loaded ASR pipeline, rebuilding it first if a previous diarized run
+ * released it. Callers must not cache the result across an `await` that could
+ * release it again.
+ */
+async function ensurePipeline(requestId: string): Promise<AutomaticSpeechRecognitionPipeline> {
+  if (activePipeline !== null) return activePipeline;
+  if (rebuildPipeline === null) {
+    throw new Error('engine is not initialized; call init before transcribe');
+  }
+  const rebuilt = await rebuildPipeline(requestId);
+  activePipeline = rebuilt;
+  return rebuilt;
+}
+
+/** Exported for worker.test.ts (like `handleInit`); hosts reach it by message. */
+export async function handleTranscribe(
   message: Extract<HostMessage, { type: 'transcribe' }>,
 ): Promise<void> {
   const { requestId, audio, options } = message;
 
-  if (activePipeline === null || activeModelId === null) {
+  // `activePipeline` deliberately does NOT appear in this guard: a previous
+  // diarized run may have released it (see `releaseAsrPipeline`), and that is
+  // an initialized engine with its weights unloaded, not an uninitialized one.
+  // `rebuildPipeline` is what "init succeeded" actually means now.
+  if (rebuildPipeline === null || activeModelId === null) {
     send({
       type: 'error',
       requestId,
@@ -493,9 +599,14 @@ async function handleTranscribe(
     const totalSeconds = audio.length / TARGET_SAMPLE_RATE;
     const windows = planWindows(audio.length, TARGET_SAMPLE_RATE);
 
+    // Loaded already, in the common case; rebuilt here when the previous run
+    // released it for diarization.
+    const asr = await ensurePipeline(requestId);
+    if (abortedRequestIds.has(requestId)) return;
+
     // Audio that fits in one window skips the loop machinery entirely.
     if (windows.length <= 1) {
-      const output = await activePipeline(audio, asrOptions);
+      const output = await asr(audio, asrOptions);
       if (abortedRequestIds.has(requestId)) return;
       await completeTranscribe(requestId, toSegments(output, totalSeconds), audio, options);
       return;
@@ -512,7 +623,7 @@ async function handleTranscribe(
     for (const window of windows) {
       if (abortedRequestIds.has(requestId)) return; // ack already sent by handleAbort
       const slice = audio.subarray(window.startSample, window.endSample);
-      const output = await activePipeline(slice, asrOptions);
+      const output = await asr(slice, asrOptions);
       if (abortedRequestIds.has(requestId)) return;
 
       const windowSeconds = window.endSeconds - window.startSeconds;
@@ -560,6 +671,12 @@ async function completeTranscribe(
   let finalSegments = segments;
   if (options.diarize) {
     try {
+      // The two phases are sequential, so they never need to be resident at
+      // the same time — and on a phone, holding all three graphs at once is
+      // what ended the session (see `releaseAsrPipeline`). The transcript is
+      // already computed and captured in `segments`; nothing below reads the
+      // pipeline again, and the next transcribe rebuilds it.
+      await releaseAsrPipeline();
       const { runSegmentation, runEmbedding } = await ensureDiarizer(requestId);
       if (abortedRequestIds.has(requestId)) return;
       const turns = await diarize(
@@ -581,6 +698,12 @@ async function completeTranscribe(
     } catch (err) {
       console.error('diarization failed; returning transcript without speakers', err);
       finalSegments = segments;
+    } finally {
+      // However this run ended — labelled, unlabelled or aborted — the two
+      // diarization graphs have no next reader. Keeping them resident for a
+      // hypothetical second diarized file is exactly the bet that costs a
+      // phone its tab; rebuilding them from Cache Storage costs seconds.
+      await releaseDiarizer();
     }
   }
   send({ type: 'complete', requestId, segments: finalSegments });
