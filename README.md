@@ -3,7 +3,7 @@
 **Local-first, in-browser speech-to-text.** Whisper running entirely in the
 browser — WebGPU where it works, a single-threaded WASM (SIMD) floor everywhere
 else — with timestamps, speaker labels, and SRT/VTT/TXT/JSON export. **The audio
-never leaves the device: nothing is uploaded.**
+never leaves the device: there is no upload step and no server.**
 
 This is the engine behind the free, unlimited transcription at
 **[yourdevice.app/transcribe](https://yourdevice.app/transcribe)** — try it there
