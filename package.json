@@ -1,6 +1,6 @@
 {
   "name": "@yourdevice/engine",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Local-first, in-browser speech-to-text engine. Whisper on WebGPU/WASM (WebNN as progressive enhancement) — audio never leaves the device.",
   "license": "MIT",
   "author": "Wangle Media (https://yourdevice.app)",
